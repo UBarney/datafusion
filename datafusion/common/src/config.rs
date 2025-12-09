@@ -468,6 +468,9 @@ config_namespace! {
         /// metadata memory consumption
         pub batch_size: usize, default = 8192
 
+        /// Maximum array size for perfect hash join.
+        pub perfect_hash_join_max_array_size: usize, default = 819200
+
         /// When set to true, record batches will be examined between each operator and
         /// small batches will be coalesced into larger batches. This is helpful when there
         /// are highly selective filters or joins that could produce tiny output batches. The

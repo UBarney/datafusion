@@ -23,7 +23,7 @@
 use std::sync::Arc;
 use std::task::Poll;
 
-use crate::joins::hash_join::exec::JoinLeftData;
+use crate::joins::hash_join::exec::{JoinLeftData, Map};
 use crate::joins::hash_join::shared_bounds::{
     PartitionBuildDataReport, SharedBuildAccumulator,
 };
@@ -44,8 +44,13 @@ use crate::{
     RecordBatchStream, SendableRecordBatchStream,
 };
 
-use arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::array::{
+    Array, ArrayRef, AsArray, PrimitiveBuilder, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::{
+    DataType, Int16Type, Int32Type, Int64Type, Int8Type, Schema, SchemaRef, UInt16Type,
+    UInt32Type, UInt64Type, UInt8Type,
+};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{
     internal_datafusion_err, internal_err, JoinSide, JoinType, NullEquality, Result,
@@ -204,8 +209,8 @@ pub(super) struct HashJoinStream {
     build_side: BuildSide,
     /// Maximum output batch size
     batch_size: usize,
-    /// Scratch space for computing hashes
-    hashes_buffer: Vec<u64>,
+    /// Scratch space for prob side
+    prob_side_buffer: Vec<u64>,
     /// Specifies whether the right side has an ordering to potentially preserve
     right_side_ordered: bool,
     /// Shared build accumulator for coordinating dynamic filter updates (collects hash maps and/or bounds, optional)
@@ -362,7 +367,7 @@ impl HashJoinStream {
             state,
             build_side,
             batch_size,
-            hashes_buffer,
+            prob_side_buffer: hashes_buffer,
             right_side_ordered,
             build_accumulator,
             build_waiter: None,
@@ -490,9 +495,48 @@ impl HashJoinStream {
                 // Precalculate hash values for fetched batch
                 let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
 
-                self.hashes_buffer.clear();
-                self.hashes_buffer.resize(batch.num_rows(), 0);
-                create_hashes(&keys_values, &self.random_state, &mut self.hashes_buffer)?;
+                self.prob_side_buffer.clear();
+                self.prob_side_buffer.resize(batch.num_rows(), 0);
+
+                match self.build_side.try_as_ready()?.left_data.map() {
+                    Map::HashMap(_) => {
+                        create_hashes(
+                            &keys_values,
+                            &self.random_state,
+                            &mut self.prob_side_buffer,
+                        )?;
+                    }
+                    Map::ArrayKV { data: _, offset: _ } => {
+                        // probSide -> u64
+                        assert_eq!(1, keys_values.len());
+                        let array = &keys_values[0];
+
+                        macro_rules! fill_buffer {
+                            ($ARR_TYPE:ty) => {{
+                                let arr = array.as_primitive::<$ARR_TYPE>();
+                                for (i, val) in arr.values().iter().enumerate() {
+                                    self.prob_side_buffer[i] = *val as u64;
+                                }
+                            }};
+                        }
+
+                        // TODO: 应该可以避免这次 cp 直接在 process 的时候转为 u64 ?
+                        match array.data_type() {
+                            DataType::Int8 => fill_buffer!(Int8Type),
+                            DataType::Int16 => fill_buffer!(Int16Type),
+                            DataType::Int32 => fill_buffer!(Int32Type),
+                            DataType::Int64 => fill_buffer!(Int64Type),
+                            DataType::UInt8 => fill_buffer!(UInt8Type),
+                            DataType::UInt16 => fill_buffer!(UInt16Type),
+                            DataType::UInt32 => fill_buffer!(UInt32Type),
+                            DataType::UInt64 => fill_buffer!(UInt64Type),
+                            _ => internal_err!(
+                                "Unsupported data type for ArrayKV join: {:?}",
+                                array.data_type()
+                            )?,
+                        }
+                    }
+                }
 
                 self.join_metrics.input_batches.add(1);
                 self.join_metrics.input_rows.add(batch.num_rows());
@@ -527,7 +571,12 @@ impl HashJoinStream {
         let timer = self.join_metrics.join_time.timer();
 
         // if the left side is empty, we can skip the (potentially expensive) join operation
-        if build_side.left_data.hash_map.is_empty() && self.filter.is_none() {
+        let is_empty = match build_side.left_data.map() {
+            Map::HashMap(map) => map.is_empty(),
+            Map::ArrayKV { data, .. } => data.is_empty(),
+        };
+
+        if is_empty && self.filter.is_none() {
             let result = build_batch_empty_build_side(
                 &self.schema,
                 build_side.left_data.batch(),
@@ -543,15 +592,53 @@ impl HashJoinStream {
         }
 
         // get the matched by join keys indices
-        let (left_indices, right_indices, next_offset) = lookup_join_hashmap(
-            build_side.left_data.hash_map(),
-            build_side.left_data.values(),
-            &state.values,
-            self.null_equality,
-            &self.hashes_buffer,
-            self.batch_size,
-            state.offset,
-        )?;
+        let (left_indices, right_indices, next_offset) = match build_side.left_data.map()
+        {
+            Map::HashMap(map) => lookup_join_hashmap(
+                map.as_ref(),
+                build_side.left_data.values(),
+                &state.values,
+                self.null_equality,
+                &self.prob_side_buffer,
+                self.batch_size,
+                state.offset,
+            )?,
+            Map::ArrayKV {
+                data,
+                offset: build_offset,
+            } => {
+                let mut build_indices = PrimitiveBuilder::<UInt64Type>::with_capacity(
+                    self.prob_side_buffer.len(),
+                );
+                let mut prob_indices = PrimitiveBuilder::<UInt32Type>::with_capacity(
+                    self.prob_side_buffer.len(),
+                );
+
+                let end =
+                    (state.offset.0 + self.batch_size).min(self.prob_side_buffer.len());
+
+                for (prob_idx, prob_val) in self.prob_side_buffer[state.offset.0..end]
+                    .iter()
+                    .enumerate()
+                {
+                    let idx_in_build_side = (prob_val - build_offset) as usize;
+
+                    if idx_in_build_side >= data.len() || data[idx_in_build_side] == 0 {
+                        continue;
+                    }
+                    build_indices.append_value(data[idx_in_build_side] - 1);
+                    prob_indices.append_value((prob_idx + state.offset.0) as u32);
+                }
+
+                let next_offset = if end == self.prob_side_buffer.len() {
+                    None
+                } else {
+                    Some((end, None))
+                };
+
+                (build_indices.finish(), prob_indices.finish(), next_offset)
+            }
+        };
 
         let distinct_right_indices_count = count_distinct_sorted_indices(&right_indices);
 

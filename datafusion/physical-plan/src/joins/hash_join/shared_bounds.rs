@@ -42,9 +42,9 @@ use tokio::sync::Barrier;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ColumnBounds {
     /// The minimum value observed for this column
-    min: ScalarValue,
+    pub(crate) min: ScalarValue,
     /// The maximum value observed for this column  
-    max: ScalarValue,
+    pub(crate) max: ScalarValue,
 }
 
 impl ColumnBounds {
