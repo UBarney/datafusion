@@ -93,6 +93,78 @@ use parking_lot::Mutex;
 pub(crate) const HASH_JOIN_SEED: RandomState =
     RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
 
+fn try_create_array_kv(
+    bounds: &Option<PartitionBounds>,
+    left_values: &[ArrayRef],
+    reservation: &mut MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+    max_array_size: usize,
+) -> Result<Option<ArrayKV>> {
+    let num_rows = left_values[0].len();
+    if !(left_values.len() == 1 && num_rows <= max_array_size) {
+        return Ok(None);
+    }
+
+    let min_max = bounds
+        .as_ref()
+        .and_then(|x| x.get_column_bounds(0))
+        .map(|cb| (cb.min.clone(), cb.max.clone()));
+
+    let (min_val, max_val) = if let Some((min_val, max_val)) = min_max {
+        let left_values_have_null = left_values[0].null_count() > 0;
+
+        if min_val.is_null() || max_val.is_null() || left_values_have_null {
+            return Ok(None);
+        }
+
+        let to_i128 = |v: &ScalarValue| -> Option<i128> {
+            match v {
+                ScalarValue::Int8(Some(v)) => Some(*v as i128),
+                ScalarValue::Int16(Some(v)) => Some(*v as i128),
+                ScalarValue::Int32(Some(v)) => Some(*v as i128),
+                ScalarValue::Int64(Some(v)) => Some(*v as i128),
+                ScalarValue::UInt8(Some(v)) => Some(*v as i128),
+                ScalarValue::UInt16(Some(v)) => Some(*v as i128),
+                ScalarValue::UInt32(Some(v)) => Some(*v as i128),
+                ScalarValue::UInt64(Some(v)) => Some(*v as i128),
+                _ => None,
+            }
+        };
+
+        if let Some((mi, ma)) = to_i128(&min_val).zip(to_i128(&max_val)) {
+            (mi, ma)
+        } else {
+            return Ok(None);
+        }
+    } else {
+        return Ok(None);
+    };
+
+    if min_val > max_val {
+        return internal_err!("min_val>max_val"); // TODO: more detail
+    }
+
+    let range = max_val - min_val;
+    if range > max_array_size as i128 {
+        return Ok(None);
+    }
+
+    let offset_val = min_val as u64;
+
+    let size = (range + 1) as usize;
+    let mem_size = size * size_of::<u64>();
+
+    reservation.try_grow(mem_size)?;
+    metrics.build_mem_used.add(mem_size);
+
+    let array_kv = ArrayKV::try_new(left_values, offset_val, size)?;
+    if array_kv.is_none() {
+        reservation.shrink(mem_size);
+        metrics.build_mem_used.sub(mem_size);
+    }
+    Ok(array_kv)
+}
+
 pub struct ArrayKV {
     data: Vec<u64>,
     offset: u64,
@@ -107,74 +179,13 @@ impl ArrayKV {
         self.offset
     }
 
-    pub fn try_new(
-        bounds: &Option<PartitionBounds>,
+    fn try_new(
         left_values: &[ArrayRef],
-        reservation: &mut MemoryReservation,
-        metrics: &BuildProbeJoinMetrics,
-        max_array_size: usize,
+        offset_val: u64,
+        size: usize,
     ) -> Result<Option<Self>> {
-        let num_rows = left_values[0].len();
-        if !(left_values.len() == 1 && num_rows <= max_array_size) {
-            return Ok(None);
-        }
-
-        let min_max = bounds
-            .as_ref()
-            .and_then(|x| x.get_column_bounds(0))
-            .map(|cb| (cb.min.clone(), cb.max.clone()));
-
-        let (min_val, max_val) = if let Some((min_val, max_val)) = min_max {
-            // Perfect hash is only for single column with integer key.
-            // It also doesn't support nulls.
-            let left_values_have_null = left_values[0].null_count() > 0;
-
-            if min_val.is_null() || max_val.is_null() || left_values_have_null {
-                return Ok(None);
-            }
-
-            let to_i128 = |v: &ScalarValue| -> Option<i128> {
-                match v {
-                    ScalarValue::Int8(Some(v)) => Some(*v as i128),
-                    ScalarValue::Int16(Some(v)) => Some(*v as i128),
-                    ScalarValue::Int32(Some(v)) => Some(*v as i128),
-                    ScalarValue::Int64(Some(v)) => Some(*v as i128),
-                    ScalarValue::UInt8(Some(v)) => Some(*v as i128),
-                    ScalarValue::UInt16(Some(v)) => Some(*v as i128),
-                    ScalarValue::UInt32(Some(v)) => Some(*v as i128),
-                    ScalarValue::UInt64(Some(v)) => Some(*v as i128),
-                    _ => None,
-                }
-            };
-
-            if let Some((mi, ma)) = to_i128(&min_val).zip(to_i128(&max_val)) {
-                (mi, ma)
-            } else {
-                return Ok(None);
-            }
-        } else {
-            return Ok(None);
-        };
-
-        if min_val > max_val {
-            return internal_err!("min_val>max_val"); // TODO: more detail
-        }
-
-        let range = max_val - min_val;
-        if range > max_array_size as i128 {
-            return Ok(None);
-        }
-
-        let offset_val = min_val as u64;
-
-        let size = range + 1;
-        let mem_size = (size as usize) * size_of::<u64>();
-
-        reservation.try_grow(mem_size)?;
-        metrics.build_mem_used.add(mem_size);
-
         // Initialize with 0 (sentinel for not found)
-        let mut data = vec![0; size as usize];
+        let mut data = vec![0; size];
 
         let array = &left_values[0];
 
@@ -191,7 +202,7 @@ impl ArrayKV {
                     }
 
                     if data[idx] != 0 {
-                        // TODO: 在 reservation 中释放内存
+                        // Duplicates are not allowed, fallback to the default hash join implementation
                         return Ok(None);
                     }
                     data[idx] = (i) as u64 + 1;
@@ -1730,7 +1741,7 @@ async fn collect_left_input(
         _ => None,
     };
 
-    let array_kv = ArrayKV::try_new(
+    let array_kv = try_create_array_kv(
         &bounds,
         &left_values,
         &mut reservation,
