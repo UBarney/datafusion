@@ -44,15 +44,13 @@ use crate::{
 };
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, PrimitiveBuilder, UInt32Array, UInt64Array,
+    Array, ArrayRef, UInt32Array, UInt64Array,
 };
 use arrow::compute::BatchCoalescer;
 use arrow::datatypes::{
-    Int8Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef, UInt8Type, UInt16Type,
-    UInt32Type, UInt64Type,
+    Schema, SchemaRef,
 };
 use arrow::record_batch::RecordBatch;
-use arrow_schema::DataType;
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, internal_datafusion_err, internal_err,
 };
@@ -642,40 +640,11 @@ impl HashJoinStream {
                 &mut self.build_indices_buffer,
             )?,
             Map::ArrayKV(array_kv) => {
-                // TODO: mv to ArrayKV.find_match
-                let mut build_indices = PrimitiveBuilder::<UInt64Type>::with_capacity(
-                    self.prob_side_buffer.len(),
-                );
-                let mut prob_indices = PrimitiveBuilder::<UInt32Type>::with_capacity(
-                    self.prob_side_buffer.len(),
-                );
-
-                let end =
-                    (state.offset.0 + self.batch_size).min(self.prob_side_buffer.len());
-
-                for (prob_idx, prob_val) in self.prob_side_buffer[state.offset.0..end]
-                    .iter()
-                    .enumerate()
-                {
-                    let idx_in_build_side =
-                        (prob_val.wrapping_sub(array_kv.offset())) as usize;
-
-                    if idx_in_build_side >= array_kv.data().len()
-                        || array_kv.data()[idx_in_build_side] == 0
-                    {
-                        continue;
-                    }
-                    build_indices.append_value(array_kv.data()[idx_in_build_side] - 1);
-                    prob_indices.append_value((prob_idx + state.offset.0) as u32);
-                }
-
-                let next_offset = if end == self.prob_side_buffer.len() {
-                    None
-                } else {
-                    Some((end, None))
-                };
-
-                (build_indices.finish(), prob_indices.finish(), next_offset)
+                array_kv.get_matched_indices_with_limit_offset(
+                    &self.prob_side_buffer,
+                    self.batch_size,
+                    state.offset,
+                )?
             }
         };
 
