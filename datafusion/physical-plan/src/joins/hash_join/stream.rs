@@ -569,36 +569,8 @@ impl HashJoinStream {
                             &mut self.prob_side_buffer,
                         )?;
                     }
-                    Map::ArrayKV(_) => {
-                        // probSide -> u64
-                        // TODO: mv to arrayKV.process_prob_side()
-                        assert_eq!(1, keys_values.len());
-                        let array = &keys_values[0];
-
-                        macro_rules! fill_buffer {
-                            ($ARR_TYPE:ty) => {{
-                                let arr = array.as_primitive::<$ARR_TYPE>();
-                                for (i, val) in arr.values().iter().enumerate() {
-                                    self.prob_side_buffer[i] = *val as u64;
-                                }
-                            }};
-                        }
-
-                        // TODO: 应该可以避免这次 cp 直接在 process 的时候转为 u64 ?
-                        match array.data_type() {
-                            DataType::Int8 => fill_buffer!(Int8Type),
-                            DataType::Int16 => fill_buffer!(Int16Type),
-                            DataType::Int32 => fill_buffer!(Int32Type),
-                            DataType::Int64 => fill_buffer!(Int64Type),
-                            DataType::UInt8 => fill_buffer!(UInt8Type),
-                            DataType::UInt16 => fill_buffer!(UInt16Type),
-                            DataType::UInt32 => fill_buffer!(UInt32Type),
-                            DataType::UInt64 => fill_buffer!(UInt64Type),
-                            _ => internal_err!(
-                                "Unsupported data type for ArrayKV join: {:?}",
-                                array.data_type()
-                            )?,
-                        }
+                    Map::ArrayKV(array_kv) => {
+                        array_kv.process_prob_side(&keys_values, &mut self.prob_side_buffer)?;
                     }
                 }
 

@@ -221,6 +221,40 @@ impl ArrayKV {
             offset: offset_val,
         }))
     }
+
+    pub fn process_prob_side(
+        &self,
+        keys_values: &[ArrayRef],
+        prob_side_buffer: &mut Vec<u64>,
+    ) -> Result<()> {
+        assert_eq!(1, keys_values.len());
+        let array = &keys_values[0];
+
+        macro_rules! fill_buffer {
+            ($ARR_TYPE:ty) => {{
+                let arr = array.as_primitive::<$ARR_TYPE>();
+                for (i, val) in arr.values().iter().enumerate() {
+                    prob_side_buffer[i] = *val as u64;
+                }
+            }};
+        }
+
+        match array.data_type() {
+            DataType::Int8 => fill_buffer!(Int8Type),
+            DataType::Int16 => fill_buffer!(Int16Type),
+            DataType::Int32 => fill_buffer!(Int32Type),
+            DataType::Int64 => fill_buffer!(Int64Type),
+            DataType::UInt8 => fill_buffer!(UInt8Type),
+            DataType::UInt16 => fill_buffer!(UInt16Type),
+            DataType::UInt32 => fill_buffer!(UInt32Type),
+            DataType::UInt64 => fill_buffer!(UInt64Type),
+            _ => internal_err!(
+                "Unsupported data type for ArrayKV join: {:?}",
+                array.data_type()
+            )?,
+        }
+        Ok(())
+    }
 }
 
 pub enum Map {
