@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use crate::joins::PartitionMode;
-use crate::joins::hash_join::exec::{JoinLeftData, Map};
+use crate::joins::array_kv::Map;
+use crate::joins::hash_join::exec::JoinLeftData;
 use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };

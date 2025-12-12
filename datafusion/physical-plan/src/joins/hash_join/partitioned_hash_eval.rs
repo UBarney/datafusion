@@ -36,7 +36,7 @@ use datafusion_physical_expr_common::{
     utils::evaluate_expressions_to_arrays,
 };
 
-use crate::{hash_utils::create_hashes, joins::hash_join::exec::Map};
+use crate::{hash_utils::create_hashes, joins::array_kv::Map};
 
 /// Physical expression that computes hash values for a set of columns
 ///

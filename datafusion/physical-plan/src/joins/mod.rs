@@ -38,6 +38,7 @@ pub mod utils;
 
 mod join_filter;
 mod join_hash_map;
+mod array_kv;
 
 #[cfg(test)]
 pub mod test_utils;
