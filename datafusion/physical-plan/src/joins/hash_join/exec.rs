@@ -115,7 +115,7 @@ impl ArrayKV {
         max_array_size: usize,
     ) -> Result<Option<Self>> {
         let num_rows = left_values[0].len();
-        if !(left_values.len() == 1 && num_rows > 0 && num_rows <= max_array_size) {
+        if !(left_values.len() == 1 && num_rows <= max_array_size) {
             return Ok(None);
         }
 
@@ -160,7 +160,7 @@ impl ArrayKV {
             return internal_err!("min_val>max_val"); // TODO: more detail
         }
 
-        let range = max_val.saturating_sub(min_val);
+        let range = max_val - min_val;
         if range > max_array_size as i128 {
             return Ok(None);
         }
@@ -260,7 +260,7 @@ impl ArrayKV {
         &self,
         prob_side_buffer: &[u64],
         batch_size: usize,
-        current_offset: JoinHashMapOffset, // Renamed from 'offset' to avoid confusion with self.offset
+        current_offset: JoinHashMapOffset,
     ) -> Result<(UInt64Array, UInt32Array, Option<JoinHashMapOffset>)> {
         let mut build_indices = PrimitiveBuilder::<UInt64Type>::with_capacity(
             prob_side_buffer.len(),
@@ -1730,8 +1730,7 @@ async fn collect_left_input(
         _ => None,
     };
 
-    // TODO: mv to ArrayKV::try_build_array_kv_map
-    let array_kv_instance = ArrayKV::try_new(
+    let array_kv = ArrayKV::try_new(
         &bounds,
         &left_values,
         &mut reservation,
@@ -1739,7 +1738,7 @@ async fn collect_left_input(
         perfect_hash_join_max_array_size,
     )?;
 
-    let join_hash_map = if let Some(array_kv) = array_kv_instance {
+    let join_hash_map = if let Some(array_kv) = array_kv {
         Map::ArrayKV(array_kv)
     } else {
         // Estimation of memory size, required for hashtable, prior to allocation.
