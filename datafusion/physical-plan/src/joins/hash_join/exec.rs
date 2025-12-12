@@ -34,7 +34,7 @@ use crate::joins::hash_join::shared_bounds::{
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
-use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64, JoinHashMapOffset};
+use crate::joins::join_hash_map::{JoinHashMapOffset, JoinHashMapU32, JoinHashMapU64};
 use crate::joins::utils::{
     OnceAsync, OnceFut, asymmetric_join_output_partitioning, reorder_output_after_swap,
     swap_join_projection, update_hash,
@@ -58,7 +58,9 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{ArrayRef, AsArray, BooleanBufferBuilder, PrimitiveBuilder, UInt32Array, UInt64Array};
+use arrow::array::{
+    ArrayRef, AsArray, BooleanBufferBuilder, PrimitiveBuilder, UInt32Array, UInt64Array,
+};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{
     Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef, UInt8Type, UInt16Type,
@@ -272,40 +274,33 @@ impl ArrayKV {
         prob_side_buffer: &[u64],
         batch_size: usize,
         current_offset: JoinHashMapOffset,
-    ) -> Result<(UInt64Array, UInt32Array, Option<JoinHashMapOffset>)> {
-        let mut build_indices = PrimitiveBuilder::<UInt64Type>::with_capacity(
-            prob_side_buffer.len(),
-        );
-        let mut prob_indices = PrimitiveBuilder::<UInt32Type>::with_capacity(
-            prob_side_buffer.len(),
-        );
+        input_indices: &mut Vec<u32>,
+        match_indices: &mut Vec<u64>,
+    ) -> Option<JoinHashMapOffset> {
+        input_indices.clear();
+        match_indices.clear();
 
-        let end =
-            (current_offset.0 + batch_size).min(prob_side_buffer.len());
+        let end = (current_offset.0 + batch_size).min(prob_side_buffer.len());
 
-        for (prob_idx, prob_val) in prob_side_buffer[current_offset.0..end]
-            .iter()
-            .enumerate()
+        for (prob_idx, prob_val) in
+            prob_side_buffer[current_offset.0..end].iter().enumerate()
         {
-            let idx_in_build_side =
-                (prob_val.wrapping_sub(self.offset())) as usize; // Use self.offset()
+            let idx_in_build_side = (prob_val.wrapping_sub(self.offset())) as usize;
 
-            if idx_in_build_side >= self.data().len() // Use self.data().len()
-                || self.data()[idx_in_build_side] == 0 // Use self.data()[idx_in_build_side]
+            if idx_in_build_side >= self.data().len()
+                || self.data()[idx_in_build_side] == 0
             {
                 continue;
             }
-            build_indices.append_value(self.data()[idx_in_build_side] - 1); // Use self.data()[idx_in_build_side]
-            prob_indices.append_value((prob_idx + current_offset.0) as u32);
+            match_indices.push(self.data()[idx_in_build_side] - 1);
+            input_indices.push((prob_idx + current_offset.0) as u32);
         }
 
-        let next_offset = if end == prob_side_buffer.len() {
+        if end == prob_side_buffer.len() {
             None
         } else {
             Some((end, None))
-        };
-
-        Ok((build_indices.finish(), prob_indices.finish(), next_offset))
+        }
     }
 }
 
@@ -1625,8 +1620,6 @@ fn should_collect_min_max_for_perfect_hash(
             | DataType::UInt64
     ))
 }
-
-
 
 /// Collects all batches from the left (build) side stream and creates a hash map for joining.
 ///

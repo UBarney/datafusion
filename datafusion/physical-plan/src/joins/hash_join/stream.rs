@@ -640,11 +640,18 @@ impl HashJoinStream {
                 &mut self.build_indices_buffer,
             )?,
             Map::ArrayKV(array_kv) => {
-                array_kv.get_matched_indices_with_limit_offset(
+                let next_offset = array_kv.get_matched_indices_with_limit_offset(
                     &self.prob_side_buffer,
                     self.batch_size,
                     state.offset,
-                )?
+                    &mut self.probe_indices_buffer,
+                    &mut self.build_indices_buffer,
+                );
+                (
+                    std::mem::take(&mut self.build_indices_buffer).into(),
+                    std::mem::take(&mut self.probe_indices_buffer).into(),
+                    next_offset,
+                )
             }
         };
 
