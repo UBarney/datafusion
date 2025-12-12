@@ -300,7 +300,7 @@ impl PhysicalExpr for HashTableLookupExpr {
                     }
                 }
             }
-            Map::ArrayKV { data, offset } => {
+            Map::ArrayKV(array_kv) => {
                 // TODO: to ArrayKV strcut and adding method
                 if self.right_expr.len() != 1 {
                     return Err(internal_datafusion_err!(
@@ -336,8 +336,8 @@ impl PhysicalExpr for HashTableLookupExpr {
                 }
 
                 for (i, v) in right_side.iter().enumerate() {
-                    let idx = (v.wrapping_sub(*offset)) as usize;
-                    if idx < data.len() && data[idx] != 0 {
+                    let idx = (v.wrapping_sub(array_kv.offset())) as usize;
+                    if idx < array_kv.data().len() && array_kv.data()[idx] != 0 {
                         bit_util::set_bit(buf.as_slice_mut(), i);
                     }
                 }

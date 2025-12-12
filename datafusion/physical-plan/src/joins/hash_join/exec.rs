@@ -93,24 +93,34 @@ use parking_lot::Mutex;
 pub(crate) const HASH_JOIN_SEED: RandomState =
     RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
 
+pub struct ArrayKV {
+    data: Vec<u64>,
+    offset: u64,
+}
+
+impl ArrayKV {
+    pub fn data(&self) -> &[u64] {
+        &self.data
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+}
+
 pub enum Map {
     HashMap(Arc<dyn JoinHashMapType>),
-    ArrayKV {
-        // data[build_side_val - offset] = idx_in_build_side + 1
-        // data[build_side_val - offset] == 0 mean not exsit
-        data: Vec<u64>,
-        offset: u64,
-    },
+    ArrayKV(ArrayKV),
 }
 
 impl fmt::Debug for Map {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Map::HashMap(_) => write!(f, "JoinHashMap::HashMap(...)"),
-            Map::ArrayKV { data, offset } => f
+            Map::ArrayKV(array_kv) => f
                 .debug_struct("JoinHashMap::ArrayKV")
-                .field("data_len", &data.len())
-                .field("offset", offset)
+                .field("data_len", &array_kv.data.len())
+                .field("offset", &array_kv.offset)
                 .finish(),
         }
     }
@@ -121,7 +131,7 @@ impl Map {
     pub fn len(&self) -> usize {
         match self {
             Map::HashMap(map) => map.len(),
-            Map::ArrayKV { data, .. } => data.len(),
+            Map::ArrayKV(array_kv) => array_kv.data.len(),
         }
     }
 
@@ -1416,13 +1426,13 @@ fn should_collect_min_max_for_perfect_hash(
 }
 
 fn try_build_array_kv_map(
-    num_rows: usize,
     bounds: &Option<PartitionBounds>,
     left_values: &[ArrayRef],
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
     max_array_size: usize,
 ) -> Result<Option<Map>> {
+    let num_rows = left_values[0].len();
     if !(left_values.len() == 1 && num_rows > 0 && num_rows <= max_array_size) {
         return Ok(None);
     }
@@ -1524,10 +1534,10 @@ fn try_build_array_kv_map(
         }
     }
 
-    Ok(Some(Map::ArrayKV {
+    Ok(Some(Map::ArrayKV(ArrayKV {
         data,
         offset: offset_val,
-    }))
+    })))
 }
 
 /// Collects all batches from the left (build) side stream and creates a hash map for joining.
@@ -1643,8 +1653,8 @@ async fn collect_left_input(
         _ => None,
     };
 
+    // TODO: mv to ArrayKV::try_build_array_kv_map
     let array_kv_map = try_build_array_kv_map(
-        num_rows,
         &bounds,
         &left_values,
         &mut reservation,

@@ -569,8 +569,9 @@ impl HashJoinStream {
                             &mut self.prob_side_buffer,
                         )?;
                     }
-                    Map::ArrayKV { data: _, offset: _ } => {
+                    Map::ArrayKV(_) => {
                         // probSide -> u64
+                        // TODO: mv to arrayKV.process_prob_side()
                         assert_eq!(1, keys_values.len());
                         let array = &keys_values[0];
 
@@ -636,7 +637,7 @@ impl HashJoinStream {
         // if the left side is empty, we can skip the (potentially expensive) join operation
         let is_empty = match build_side.left_data.map() {
             Map::HashMap(map) => map.is_empty(),
-            Map::ArrayKV { data, .. } => data.is_empty(),
+            Map::ArrayKV(array_kv) => array_kv.data().is_empty(),
         };
 
         if is_empty && self.filter.is_none() {
@@ -668,10 +669,8 @@ impl HashJoinStream {
                 &mut self.probe_indices_buffer,
                 &mut self.build_indices_buffer,
             )?,
-            Map::ArrayKV {
-                data,
-                offset: build_offset,
-            } => {
+            Map::ArrayKV(array_kv) => {
+                // TODO: mv to ArrayKV.find_match
                 let mut build_indices = PrimitiveBuilder::<UInt64Type>::with_capacity(
                     self.prob_side_buffer.len(),
                 );
@@ -687,12 +686,14 @@ impl HashJoinStream {
                     .enumerate()
                 {
                     let idx_in_build_side =
-                        (prob_val.wrapping_sub(*build_offset)) as usize;
+                        (prob_val.wrapping_sub(array_kv.offset())) as usize;
 
-                    if idx_in_build_side >= data.len() || data[idx_in_build_side] == 0 {
+                    if idx_in_build_side >= array_kv.data().len()
+                        || array_kv.data()[idx_in_build_side] == 0
+                    {
                         continue;
                     }
-                    build_indices.append_value(data[idx_in_build_side] - 1);
+                    build_indices.append_value(array_kv.data()[idx_in_build_side] - 1);
                     prob_indices.append_value((prob_idx + state.offset.0) as u32);
                 }
 
