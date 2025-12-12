@@ -106,6 +106,121 @@ impl ArrayKV {
     pub fn offset(&self) -> u64 {
         self.offset
     }
+
+    pub fn try_new(
+        bounds: &Option<PartitionBounds>,
+        left_values: &[ArrayRef],
+        reservation: &mut MemoryReservation,
+        metrics: &BuildProbeJoinMetrics,
+        max_array_size: usize,
+    ) -> Result<Option<Self>> {
+        let num_rows = left_values[0].len();
+        if !(left_values.len() == 1 && num_rows > 0 && num_rows <= max_array_size) {
+            return Ok(None);
+        }
+
+        let min_max = bounds
+            .as_ref()
+            .and_then(|x| x.get_column_bounds(0))
+            .map(|cb| (cb.min.clone(), cb.max.clone()));
+
+        let (min_val, max_val) = if let Some((min_val, max_val)) = min_max {
+            // Perfect hash is only for single column with integer key.
+            // It also doesn't support nulls.
+            let left_values_have_null = left_values[0].null_count() > 0;
+
+            if min_val.is_null() || max_val.is_null() || left_values_have_null {
+                return Ok(None);
+            }
+
+            let to_i128 = |v: &ScalarValue| -> Option<i128> {
+                match v {
+                    ScalarValue::Int8(Some(v)) => Some(*v as i128),
+                    ScalarValue::Int16(Some(v)) => Some(*v as i128),
+                    ScalarValue::Int32(Some(v)) => Some(*v as i128),
+                    ScalarValue::Int64(Some(v)) => Some(*v as i128),
+                    ScalarValue::UInt8(Some(v)) => Some(*v as i128),
+                    ScalarValue::UInt16(Some(v)) => Some(*v as i128),
+                    ScalarValue::UInt32(Some(v)) => Some(*v as i128),
+                    ScalarValue::UInt64(Some(v)) => Some(*v as i128),
+                    _ => None,
+                }
+            };
+
+            if let Some((mi, ma)) = to_i128(&min_val).zip(to_i128(&max_val)) {
+                (mi, ma)
+            } else {
+                return Ok(None);
+            }
+        } else {
+            return Ok(None);
+        };
+
+        if min_val > max_val {
+            return internal_err!("min_val>max_val"); // TODO: more detail
+        }
+
+        let range = max_val.saturating_sub(min_val);
+        if range > max_array_size as i128 {
+            return Ok(None);
+        }
+
+        let offset_val = min_val as u64;
+
+        let size = range + 1;
+        let mem_size = (size as usize) * size_of::<u64>();
+
+        reservation.try_grow(mem_size)?;
+        metrics.build_mem_used.add(mem_size);
+
+        // Initialize with 0 (sentinel for not found)
+        let mut data = vec![0; size as usize];
+
+        let array = &left_values[0];
+
+        macro_rules! fill_data {
+            ($ARR_TYPE:ty) => {{
+                let arr = array.as_primitive::<$ARR_TYPE>();
+                for (i, val) in arr.values().iter().enumerate() {
+                    let key = *val as u64;
+                    // Calculate index: key - offset
+                    let idx = key.wrapping_sub(offset_val) as usize;
+                    if idx >= data.len() {
+                        // TODO: 完善报错信息
+                        return internal_err!("failed build Array idx >= data.len()");
+                    }
+
+                    if data[idx] != 0 {
+                        // TODO: 在 reservation 中释放内存
+                        return Ok(None);
+                    }
+                    data[idx] = (i) as u64 + 1;
+                }
+            }};
+        }
+
+        match array.data_type() {
+            DataType::Int8 => fill_data!(Int8Type),
+            DataType::Int16 => fill_data!(Int16Type),
+            DataType::Int32 => fill_data!(Int32Type),
+            DataType::Int64 => fill_data!(Int64Type),
+            DataType::UInt8 => fill_data!(UInt8Type),
+            DataType::UInt16 => fill_data!(UInt16Type),
+            DataType::UInt32 => fill_data!(UInt32Type),
+            DataType::UInt64 => fill_data!(UInt64Type),
+            _ => {
+                return internal_err!(
+                    "Unsupported type for perfect hash join conversion: {:?}",
+                    array.data_type()
+                );
+            }
+        }
+
+        Ok(Some(Self {
+            data,
+            offset: offset_val,
+        }))
+    }
 }
 
 pub enum Map {
@@ -1425,120 +1540,7 @@ fn should_collect_min_max_for_perfect_hash(
     ))
 }
 
-fn try_build_array_kv_map(
-    bounds: &Option<PartitionBounds>,
-    left_values: &[ArrayRef],
-    reservation: &mut MemoryReservation,
-    metrics: &BuildProbeJoinMetrics,
-    max_array_size: usize,
-) -> Result<Option<Map>> {
-    let num_rows = left_values[0].len();
-    if !(left_values.len() == 1 && num_rows > 0 && num_rows <= max_array_size) {
-        return Ok(None);
-    }
 
-    let min_max = bounds
-        .as_ref()
-        .and_then(|x| x.get_column_bounds(0))
-        .map(|cb| (cb.min.clone(), cb.max.clone()));
-
-    let (min_val, max_val) = if let Some((min_val, max_val)) = min_max {
-        // Perfect hash is only for single column with integer key.
-        // It also doesn't support nulls.
-        let left_values_have_null = left_values[0].null_count() > 0;
-
-        if min_val.is_null() || max_val.is_null() || left_values_have_null {
-            return Ok(None);
-        }
-
-        let to_i128 = |v: &ScalarValue| -> Option<i128> {
-            match v {
-                ScalarValue::Int8(Some(v)) => Some(*v as i128),
-                ScalarValue::Int16(Some(v)) => Some(*v as i128),
-                ScalarValue::Int32(Some(v)) => Some(*v as i128),
-                ScalarValue::Int64(Some(v)) => Some(*v as i128),
-                ScalarValue::UInt8(Some(v)) => Some(*v as i128),
-                ScalarValue::UInt16(Some(v)) => Some(*v as i128),
-                ScalarValue::UInt32(Some(v)) => Some(*v as i128),
-                ScalarValue::UInt64(Some(v)) => Some(*v as i128),
-                _ => None,
-            }
-        };
-
-        if let Some((mi, ma)) = to_i128(&min_val).zip(to_i128(&max_val)) {
-            (mi, ma)
-        } else {
-            return Ok(None);
-        }
-    } else {
-        return Ok(None);
-    };
-
-    if min_val > max_val {
-        return internal_err!("min_val>max_val"); // TODO: more detail
-    }
-
-    let range = max_val.saturating_sub(min_val);
-    if range > max_array_size as i128 {
-        return Ok(None);
-    }
-
-    let offset_val = min_val as u64;
-
-    let size = range + 1;
-    let mem_size = (size as usize) * size_of::<u64>();
-
-    reservation.try_grow(mem_size)?;
-    metrics.build_mem_used.add(mem_size);
-
-    // Initialize with 0 (sentinel for not found)
-    let mut data = vec![0; size as usize];
-
-    let array = &left_values[0];
-
-    macro_rules! fill_data {
-        ($ARR_TYPE:ty) => {{
-            let arr = array.as_primitive::<$ARR_TYPE>();
-            for (i, val) in arr.values().iter().enumerate() {
-                let key = *val as u64;
-                // Calculate index: key - offset
-                let idx = key.wrapping_sub(offset_val) as usize;
-                if idx >= data.len() {
-                    // TODO: 完善报错信息
-                    return internal_err!("failed build Array idx >= data.len()");
-                }
-
-                if data[idx] != 0 {
-                    // TODO: 在 reservation 中释放内存
-                    return Ok(None);
-                }
-                data[idx] = (i) as u64 + 1;
-            }
-        }};
-    }
-
-    match array.data_type() {
-        DataType::Int8 => fill_data!(Int8Type),
-        DataType::Int16 => fill_data!(Int16Type),
-        DataType::Int32 => fill_data!(Int32Type),
-        DataType::Int64 => fill_data!(Int64Type),
-        DataType::UInt8 => fill_data!(UInt8Type),
-        DataType::UInt16 => fill_data!(UInt16Type),
-        DataType::UInt32 => fill_data!(UInt32Type),
-        DataType::UInt64 => fill_data!(UInt64Type),
-        _ => {
-            return internal_err!(
-                "Unsupported type for perfect hash join conversion: {:?}",
-                array.data_type()
-            );
-        }
-    }
-
-    Ok(Some(Map::ArrayKV(ArrayKV {
-        data,
-        offset: offset_val,
-    })))
-}
 
 /// Collects all batches from the left (build) side stream and creates a hash map for joining.
 ///
@@ -1654,7 +1656,7 @@ async fn collect_left_input(
     };
 
     // TODO: mv to ArrayKV::try_build_array_kv_map
-    let array_kv_map = try_build_array_kv_map(
+    let array_kv_instance = ArrayKV::try_new(
         &bounds,
         &left_values,
         &mut reservation,
@@ -1662,8 +1664,8 @@ async fn collect_left_input(
         perfect_hash_join_max_array_size,
     )?;
 
-    let join_hash_map = if let Some(map) = array_kv_map {
-        map
+    let join_hash_map = if let Some(array_kv) = array_kv_instance {
+        Map::ArrayKV(array_kv)
     } else {
         // Estimation of memory size, required for hashtable, prior to allocation.
         // Final result can be verified using `RawTable.allocation_info()`
