@@ -25,9 +25,9 @@ use crate::ExecutionPlan;
 use crate::ExecutionPlanProperties;
 use crate::joins::PartitionMode;
 use crate::joins::hash_join::exec::HASH_JOIN_SEED;
+use crate::joins::hash_join::exec::Map;
 use crate::joins::hash_join::inlist_builder::build_struct_fields;
 use crate::joins::hash_join::partitioned_hash_eval::{HashExpr, HashTableLookupExpr};
-use crate::joins::utils::JoinHashMapType;
 
 use ahash::RandomState;
 use arrow::array::ArrayRef;
@@ -137,6 +137,7 @@ fn create_membership_predicate(
 
             Ok(Some(Arc::new(HashTableLookupExpr::new(
                 lookup_hash_expr,
+                on_right.to_vec(),
                 hash_map,
                 "hash_lookup".to_string(),
             )) as Arc<dyn PhysicalExpr>))
@@ -241,7 +242,7 @@ pub(crate) enum PushdownStrategy {
     /// Use InList for small build sides (< 128MB)
     InList(ArrayRef),
     /// Use hash table lookup for large build sides
-    HashTable(Arc<dyn JoinHashMapType>),
+    HashTable(Arc<Map>),
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
 }

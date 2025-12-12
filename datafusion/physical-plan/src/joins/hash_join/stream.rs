@@ -43,9 +43,14 @@ use crate::{
     },
 };
 
-use arrow::array::{Array, ArrayRef, AsArray, PrimitiveBuilder, UInt32Array, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, AsArray, PrimitiveBuilder, UInt32Array, UInt64Array,
+};
 use arrow::compute::BatchCoalescer;
-use arrow::datatypes::{Int8Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef, UInt8Type, UInt16Type, UInt32Type, UInt64Type};
+use arrow::datatypes::{
+    Int8Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef, UInt8Type, UInt16Type,
+    UInt32Type, UInt64Type,
+};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::DataType;
 use datafusion_common::{
@@ -569,7 +574,6 @@ impl HashJoinStream {
                         assert_eq!(1, keys_values.len());
                         let array = &keys_values[0];
 
-
                         macro_rules! fill_buffer {
                             ($ARR_TYPE:ty) => {{
                                 let arr = array.as_primitive::<$ARR_TYPE>();
@@ -661,8 +665,8 @@ impl HashJoinStream {
                 &self.prob_side_buffer,
                 self.batch_size,
                 state.offset,
-            &mut self.probe_indices_buffer,
-            &mut self.build_indices_buffer,
+                &mut self.probe_indices_buffer,
+                &mut self.build_indices_buffer,
             )?,
             Map::ArrayKV {
                 data,
@@ -682,7 +686,8 @@ impl HashJoinStream {
                     .iter()
                     .enumerate()
                 {
-                    let idx_in_build_side = (prob_val - build_offset) as usize;
+                    let idx_in_build_side =
+                        (prob_val.wrapping_sub(*build_offset)) as usize;
 
                     if idx_in_build_side >= data.len() || data[idx_in_build_side] == 0 {
                         continue;

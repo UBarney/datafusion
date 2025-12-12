@@ -61,8 +61,8 @@ use crate::{
 use arrow::array::{ArrayRef, AsArray, BooleanBufferBuilder};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{
-    Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef, UInt8Type, UInt16Type,
+    UInt32Type, UInt64Type,
 };
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
@@ -70,10 +70,8 @@ use arrow_schema::DataType;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
-    JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, plan_err,
-    project_schema,
-    assert_or_internal_err, internal_err, plan_err, project_schema, JoinSide, JoinType,
-    NullEquality, Result, ScalarValue,
+    JoinSide, JoinType, NullEquality, Result, ScalarValue, assert_or_internal_err,
+    internal_err, plan_err, project_schema,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -95,7 +93,7 @@ use parking_lot::Mutex;
 pub(crate) const HASH_JOIN_SEED: RandomState =
     RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
 
-pub(super) enum Map {
+pub enum Map {
     HashMap(Arc<dyn JoinHashMapType>),
     ArrayKV {
         // data[build_side_val - offset] = idx_in_build_side + 1
@@ -118,12 +116,27 @@ impl fmt::Debug for Map {
     }
 }
 
+impl Map {
+    /// Returns the number of elements in the map.
+    pub fn len(&self) -> usize {
+        match self {
+            Map::HashMap(map) => map.len(),
+            Map::ArrayKV { data, .. } => data.len(),
+        }
+    }
+
+    /// Returns `true` if the map contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// HashTable and input data for the left (build side) of a join
 pub(super) struct JoinLeftData {
     /// The hash table with indices into `batch`
     /// Arc is used to allow sharing with SharedBuildAccumulator for hash map pushdown
     /// TODO: rename ?
-    pub(super) map: Map,
+    pub(super) map: Arc<Map>,
     /// The input rows for the build side
     batch: RecordBatch,
     /// The build side on expressions values
@@ -1402,35 +1415,6 @@ fn should_collect_min_max_for_perfect_hash(
     ))
 }
 
-/// Collects all batches from the left (build) side stream and creates a hash map for joining.
-///
-/// This function is responsible for:
-/// 1. Consuming the entire left stream and collecting all batches into memory
-/// 2. Building a hash map from the join key columns for efficient probe operations
-/// 3. Computing bounds for dynamic filter pushdown (if enabled)
-/// 4. Preparing visited indices bitmap for certain join types
-///
-/// # Parameters
-/// * `random_state` - Random state for consistent hashing across partitions
-/// * `left_stream` - Stream of record batches from the build side
-/// * `on_left` - Physical expressions for the left side join keys
-/// * `metrics` - Metrics collector for tracking memory usage and row counts
-/// * `reservation` - Memory reservation tracker for the hash table and data
-/// * `with_visited_indices_bitmap` - Whether to track visited indices (for outer joins)
-/// * `probe_threads_count` - Number of threads that will probe this hash table
-/// * `should_compute_dynamic_filters` - Whether to compute min/max bounds for dynamic filtering
-///
-/// # Dynamic Filter Coordination
-/// When `should_compute_dynamic_filters` is true, this function computes the min/max bounds
-/// for each join key column but does NOT update the dynamic filter. Instead, the
-/// bounds are stored in the returned `JoinLeftData` and later coordinated by
-/// `SharedBuildAccumulator` to ensure all partitions contribute their bounds
-/// before updating the filter exactly once.
-///
-/// # Returns
-/// `JoinLeftData` containing the hash map, consolidated batch, join key values,
-/// visited indices bitmap, and computed bounds (if requested).
-// #[allow(clippy::too_many_arguments)]
 fn try_build_array_kv_map(
     num_rows: usize,
     bounds: &Option<PartitionBounds>,
@@ -1536,7 +1520,7 @@ fn try_build_array_kv_map(
             return internal_err!(
                 "Unsupported type for perfect hash join conversion: {:?}",
                 array.data_type()
-            )
+            );
         }
     }
 
@@ -1546,6 +1530,34 @@ fn try_build_array_kv_map(
     }))
 }
 
+/// Collects all batches from the left (build) side stream and creates a hash map for joining.
+///
+/// This function is responsible for:
+/// 1. Consuming the entire left stream and collecting all batches into memory
+/// 2. Building a hash map from the join key columns for efficient probe operations
+/// 3. Computing bounds for dynamic filter pushdown (if enabled)
+/// 4. Preparing visited indices bitmap for certain join types
+///
+/// # Parameters
+/// * `random_state` - Random state for consistent hashing across partitions
+/// * `left_stream` - Stream of record batches from the build side
+/// * `on_left` - Physical expressions for the left side join keys
+/// * `metrics` - Metrics collector for tracking memory usage and row counts
+/// * `reservation` - Memory reservation tracker for the hash table and data
+/// * `with_visited_indices_bitmap` - Whether to track visited indices (for outer joins)
+/// * `probe_threads_count` - Number of threads that will probe this hash table
+/// * `should_compute_dynamic_filters` - Whether to compute min/max bounds for dynamic filtering
+///
+/// # Dynamic Filter Coordination
+/// When `should_compute_dynamic_filters` is true, this function computes the min/max bounds
+/// for each join key column but does NOT update the dynamic filter. Instead, the
+/// bounds are stored in the returned `JoinLeftData` and later coordinated by
+/// `SharedBuildAccumulator` to ensure all partitions contribute their bounds
+/// before updating the filter exactly once.
+///
+/// # Returns
+/// `JoinLeftData` containing the hash map, consolidated batch, join key values,
+/// visited indices bitmap, and computed bounds (if requested).
 #[expect(clippy::too_many_arguments)]
 async fn collect_left_input(
     random_state: RandomState,
@@ -1703,22 +1715,10 @@ async fn collect_left_input(
 
     let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
 
-    // Compute bounds for dynamic filter if enabled
-    let bounds = match bounds_accumulators {
-        Some(accumulators) if num_rows > 0 => {
-            let bounds = accumulators
-                .into_iter()
-                .map(CollectLeftAccumulator::evaluate)
-                .collect::<Result<Vec<_>>>()?;
-            Some(PartitionBounds::new(bounds))
-        }
-        _ => None,
-    };
-
     // Convert Box to Arc for sharing with SharedBuildAccumulator
-    let hash_map: Arc<dyn JoinHashMapType> = hashmap.into();
+    let join_hash_map = Arc::new(join_hash_map);
 
-        let membership = if num_rows == 0 {
+    let membership = if num_rows == 0 {
         PushdownStrategy::Empty
     } else {
         // If the build side is small enough we can use IN list pushdown.
@@ -1731,16 +1731,15 @@ async fn collect_left_input(
         if left_values.is_empty()
             || left_values[0].is_empty()
             || estimated_size > max_inlist_size
-            || hash_map.len() > max_inlist_distinct_values
+            || join_hash_map.len() > max_inlist_distinct_values
         {
-            PushdownStrategy::HashTable(Arc::clone(&hash_map))
+            PushdownStrategy::HashTable(Arc::clone(&join_hash_map))
         } else if let Some(in_list_values) = build_struct_inlist_values(&left_values)? {
             PushdownStrategy::InList(in_list_values)
         } else {
-            PushdownStrategy::HashTable(Arc::clone(&hash_map))
+            PushdownStrategy::HashTable(Arc::clone(&join_hash_map))
         }
     };
-
 
     let data = JoinLeftData {
         map: join_hash_map,

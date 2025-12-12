@@ -21,18 +21,22 @@ use std::{any::Any, fmt::Display, hash::Hash, sync::Arc};
 
 use ahash::RandomState;
 use arrow::{
-    array::{BooleanArray, UInt64Array},
+    array::{AsArray, BooleanArray, UInt64Array},
     buffer::MutableBuffer,
-    datatypes::{DataType, Schema},
+    datatypes::{
+        DataType, Int8Type, Int16Type, Int32Type, Int64Type, Schema, UInt8Type,
+        UInt16Type, UInt32Type, UInt64Type,
+    },
     util::bit_util,
 };
 use datafusion_common::{Result, internal_datafusion_err, internal_err};
 use datafusion_expr::ColumnarValue;
-use datafusion_physical_expr_common::physical_expr::{
-    DynHash, PhysicalExpr, PhysicalExprRef,
+use datafusion_physical_expr_common::{
+    physical_expr::{DynHash, PhysicalExpr, PhysicalExprRef},
+    utils::evaluate_expressions_to_arrays,
 };
 
-use crate::{hash_utils::create_hashes, joins::utils::JoinHashMapType};
+use crate::{hash_utils::create_hashes, joins::hash_join::exec::Map};
 
 /// Physical expression that computes hash values for a set of columns
 ///
@@ -166,8 +170,10 @@ impl PhysicalExpr for HashExpr {
 pub struct HashTableLookupExpr {
     /// Expression that computes hash values (should be a HashExpr)
     hash_expr: PhysicalExprRef,
+    /// The right expressions to check equality
+    right_expr: Vec<PhysicalExprRef>,
     /// Hash table to check against
-    hash_map: Arc<dyn JoinHashMapType>,
+    hash_map: Arc<Map>,
     /// Description for display
     description: String,
 }
@@ -177,15 +183,18 @@ impl HashTableLookupExpr {
     ///
     /// # Arguments
     /// * `hash_expr` - Expression that computes hash values
+    /// * `right_expr` - The right expressions to check equality
     /// * `hash_map` - Hash table to check membership
     /// * `description` - Description for debugging
     pub(super) fn new(
         hash_expr: PhysicalExprRef,
-        hash_map: Arc<dyn JoinHashMapType>,
+        right_expr: Vec<PhysicalExprRef>,
+        hash_map: Arc<Map>,
         description: String,
     ) -> Self {
         Self {
             hash_expr,
+            right_expr,
             hash_map,
             description,
         }
@@ -194,13 +203,18 @@ impl HashTableLookupExpr {
 
 impl std::fmt::Debug for HashTableLookupExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}({:?})", self.description, self.hash_expr)
+        write!(
+            f,
+            "{}(hash_expr={:?}, right_expr={:?})",
+            self.description, self.hash_expr, self.right_expr
+        )
     }
 }
 
 impl Hash for HashTableLookupExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.hash_expr.dyn_hash(state);
+        self.right_expr.dyn_hash(state);
         self.description.hash(state);
     }
 }
@@ -226,21 +240,21 @@ impl PhysicalExpr for HashTableLookupExpr {
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
-        vec![&self.hash_expr]
+        let mut children = vec![&self.hash_expr];
+        children.extend(self.right_expr.iter());
+        children
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        if children.len() != 1 {
-            return internal_err!(
-                "HashTableLookupExpr expects exactly 1 child, got {}",
-                children.len()
-            );
+        if children.is_empty() {
+            return internal_err!("HashTableLookupExpr expects at least 1 child, got 0");
         }
         Ok(Arc::new(HashTableLookupExpr::new(
             Arc::clone(&children[0]),
+            children[1..].to_vec(),
             Arc::clone(&self.hash_map),
             self.description.clone(),
         )))
@@ -268,16 +282,65 @@ impl PhysicalExpr for HashTableLookupExpr {
             ),
         )?;
 
-        // Check each hash against the hash table
-        let mut buf = MutableBuffer::from_len_zeroed(bit_util::ceil(num_rows, 8));
-        for (idx, hash_value) in hash_array.values().iter().enumerate() {
-            // Use get_matched_indices to check - if it returns any indices, the hash exists
-            let (matched_indices, _) = self
-                .hash_map
-                .get_matched_indices(Box::new(std::iter::once((idx, hash_value))), None);
+        let mut buf: MutableBuffer =
+            MutableBuffer::from_len_zeroed(bit_util::ceil(num_rows, 8));
 
-            if !matched_indices.is_empty() {
-                bit_util::set_bit(buf.as_slice_mut(), idx);
+        match self.hash_map.as_ref() {
+            Map::HashMap(hash_map) => {
+                // Check each hash against the hash table
+                for (idx, hash_value) in hash_array.values().iter().enumerate() {
+                    // Use get_matched_indices to check - if it returns any indices, the hash exists
+                    let (matched_indices, _) = hash_map.get_matched_indices(
+                        Box::new(std::iter::once((idx, hash_value))),
+                        None,
+                    );
+
+                    if !matched_indices.is_empty() {
+                        bit_util::set_bit(buf.as_slice_mut(), idx);
+                    }
+                }
+            }
+            Map::ArrayKV { data, offset } => {
+                // TODO: to ArrayKV strcut and adding method
+                if self.right_expr.len() != 1 {
+                    return Err(internal_datafusion_err!(
+                        "should 1 right column when using arrayKV"
+                    ));
+                }
+                let right = evaluate_expressions_to_arrays(&self.right_expr, batch)?;
+
+                let mut right_side = vec![0u64; right[0].len()];
+
+                macro_rules! fill_buffer {
+                    ($ARR_TYPE:ty) => {{
+                        let arr = right[0].as_primitive::<$ARR_TYPE>();
+                        for (i, val) in arr.values().iter().enumerate() {
+                            right_side[i] = *val as u64;
+                        }
+                    }};
+                }
+
+                match right[0].data_type() {
+                    DataType::Int8 => fill_buffer!(Int8Type),
+                    DataType::Int16 => fill_buffer!(Int16Type),
+                    DataType::Int32 => fill_buffer!(Int32Type),
+                    DataType::Int64 => fill_buffer!(Int64Type),
+                    DataType::UInt8 => fill_buffer!(UInt8Type),
+                    DataType::UInt16 => fill_buffer!(UInt16Type),
+                    DataType::UInt32 => fill_buffer!(UInt32Type),
+                    DataType::UInt64 => fill_buffer!(UInt64Type),
+                    _ => internal_err!(
+                        "Unsupported data type for ArrayKV {:?}",
+                        right[0].data_type()
+                    )?,
+                }
+
+                for (i, v) in right_side.iter().enumerate() {
+                    let idx = (v.wrapping_sub(*offset)) as usize;
+                    if idx < data.len() && data[idx] != 0 {
+                        bit_util::set_bit(buf.as_slice_mut(), i);
+                    }
+                }
             }
         }
 
