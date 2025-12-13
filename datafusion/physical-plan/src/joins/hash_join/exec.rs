@@ -102,8 +102,15 @@ fn try_create_array_kv(
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
     max_array_size: usize,
+    null_equality: NullEquality,
 ) -> Result<Option<ArrayKV>> {
     if !(left_values.len() == 1 && left_values[0].len() <= max_array_size) {
+        return Ok(None);
+    }
+
+    let left_values_have_null = left_values[0].null_count() > 0;
+
+    if null_equality == NullEquality::NullEqualsNull && left_values_have_null {
         return Ok(None);
     }
 
@@ -113,9 +120,7 @@ fn try_create_array_kv(
         .map(|cb| (cb.min.clone(), cb.max.clone()));
 
     let (min_val, max_val) = if let Some((min_val, max_val)) = min_max {
-        let left_values_have_null = left_values[0].null_count() > 0;
-
-        if min_val.is_null() || max_val.is_null() || left_values_have_null {
+        if min_val.is_null() || max_val.is_null() {
             return Ok(None);
         }
 
@@ -1032,6 +1037,7 @@ impl ExecutionPlan for HashJoinExec {
                         .optimizer
                         .hash_join_inlist_pushdown_max_distinct_values,
                     perfect_hash_join_max_array_size,
+                    self.null_equality,
                 ))
             })?,
             PartitionMode::Partitioned => {
@@ -1061,6 +1067,7 @@ impl ExecutionPlan for HashJoinExec {
                         .optimizer
                         .hash_join_inlist_pushdown_max_distinct_values,
                     perfect_hash_join_max_array_size,
+                    self.null_equality,
                 ))
             }
             PartitionMode::Auto => {
@@ -1492,6 +1499,7 @@ async fn collect_left_input(
     max_inlist_size: usize,
     max_inlist_distinct_values: usize,
     perfect_hash_join_max_array_size: usize,
+    null_equality: NullEquality,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
@@ -1570,6 +1578,7 @@ async fn collect_left_input(
         &mut reservation,
         &metrics,
         perfect_hash_join_max_array_size,
+        null_equality,
     )?;
 
     let join_hash_map = if let Some(array_kv) = array_kv {

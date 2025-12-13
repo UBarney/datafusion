@@ -26,8 +26,26 @@ use arrow::datatypes::{
     Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type,
     UInt64Type,
 };
-use datafusion_common::{Result, internal_err};
+use datafusion_common::{internal_err, NullEquality, Result};
 
+/// A "perfect" hash map for single-column integer join keys, represented as a dense array.
+///
+/// This structure is highly optimized for joins where the keys are integers within a limited
+/// range. Instead of calculating hashes, it uses the integer key itself as an index into a
+/// `Vec`, achieving O(1) lookup performance.
+///
+/// # NULL Handling
+///
+/// This optimization can be used for joins with `NullEquality::NullEqualsNothing` even if the
+/// join keys contain `NULL`s. This is because:
+///
+/// 1. `try_new` (build side): Ignores rows with `NULL` keys when creating the map. This is
+///    correct as `NULL` keys would not match anything anyway.
+/// 2. `get_matched_indices_with_limit_offset` (probe side): Skips any `NULL` keys encountered
+///    in the probe side input.
+///
+/// This structure **cannot** be used for joins with `NullEquality::NullEqualsNull` if the
+/// build side contains `NULL`s, as it does not have a mechanism to store and match `NULL` values.
 pub struct ArrayKV {
     data: Vec<u64>,
     offset: u64,
@@ -42,6 +60,13 @@ impl ArrayKV {
         self.offset
     }
 
+    /// Creates a new [`ArrayKV`] from the given array of join keys.
+    ///
+    /// Note: This function processes only the non-null values in the input `array`,
+    /// effectively ignoring any rows where the key is `NULL`.
+    ///
+    /// TODO: Support `NullEquality::NullEqualsNull` by storing null indices in a
+    /// separate `Vec` to allow for `NULL=NULL` matching in the future.
     pub(crate) fn try_new(
         array: &ArrayRef,
         offset_val: u64,
@@ -53,20 +78,24 @@ impl ArrayKV {
         macro_rules! fill_data {
             ($ARR_TYPE:ty) => {{
                 let arr = array.as_primitive::<$ARR_TYPE>();
-                for (i, val) in arr.values().iter().enumerate() {
-                    let key = *val as u64;
-                    // Calculate index: key - offset
-                    let idx = key.wrapping_sub(offset_val) as usize;
-                    if idx >= data.len() {
-                        // TODO: 完善报错信息
-                        return internal_err!("failed build Array idx >= data.len()");
-                    }
+                for (i, val) in arr.iter().enumerate() {
+                    if let Some(val) = val {
+                        let key = val as u64;
+                        // Calculate index: key - offset
+                        let idx = key.wrapping_sub(offset_val) as usize;
+                        if idx >= data.len() {
+                            // TODO: 完善报错信息
+                            return internal_err!(
+                                "failed build Array idx >= data.len()"
+                            );
+                        }
 
-                    if data[idx] != 0 {
-                        // Duplicates are not allowed, fallback to the default hash join implementation
-                        return Ok(None);
+                        if data[idx] != 0 {
+                            // Duplicates are not allowed, fallback to the default hash join implementation
+                            return Ok(None);
+                        }
+                        data[idx] = (i) as u64 + 1;
                     }
-                    data[idx] = (i) as u64 + 1;
                 }
             }};
         }
