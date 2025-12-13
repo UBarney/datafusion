@@ -44,13 +44,9 @@ use crate::{
     },
 };
 
-use arrow::array::{
-    Array, ArrayRef, UInt32Array, UInt64Array,
-};
+use arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
 use arrow::compute::BatchCoalescer;
-use arrow::datatypes::{
-    Schema, SchemaRef,
-};
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, internal_datafusion_err, internal_err,
@@ -557,20 +553,14 @@ impl HashJoinStream {
                 // Precalculate hash values for fetched batch
                 let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
 
-                self.prob_side_buffer.clear();
-                self.prob_side_buffer.resize(batch.num_rows(), 0);
-
-                match self.build_side.try_as_ready()?.left_data.map() {
-                    Map::HashMap(_) => {
-                        create_hashes(
-                            &keys_values,
-                            &self.random_state,
-                            &mut self.prob_side_buffer,
-                        )?;
-                    }
-                    Map::ArrayKV(array_kv) => {
-                        array_kv.process_prob_side(&keys_values, &mut self.prob_side_buffer)?;
-                    }
+                if let Map::HashMap(_) = self.build_side.try_as_ready()?.left_data.map() {
+                    self.prob_side_buffer.clear();
+                    self.prob_side_buffer.resize(batch.num_rows(), 0);
+                    create_hashes(
+                        &keys_values,
+                        &self.random_state,
+                        &mut self.prob_side_buffer,
+                    )?;
                 }
 
                 self.join_metrics.input_batches.add(1);
@@ -642,12 +632,12 @@ impl HashJoinStream {
             )?,
             Map::ArrayKV(array_kv) => {
                 let next_offset = array_kv.get_matched_indices_with_limit_offset(
-                    &self.prob_side_buffer,
+                    &state.values,
                     self.batch_size,
                     state.offset,
                     &mut self.probe_indices_buffer,
                     &mut self.build_indices_buffer,
-                );
+                )?;
                 (
                     std::mem::take(&mut self.build_indices_buffer).into(),
                     std::mem::take(&mut self.probe_indices_buffer).into(),

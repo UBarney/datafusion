@@ -103,8 +103,7 @@ fn try_create_array_kv(
     metrics: &BuildProbeJoinMetrics,
     max_array_size: usize,
 ) -> Result<Option<ArrayKV>> {
-    let num_rows = left_values[0].len();
-    if !(left_values.len() == 1 && num_rows <= max_array_size) {
+    if !(left_values.len() == 1 && left_values[0].len() <= max_array_size) {
         return Ok(None);
     }
 
@@ -160,15 +159,13 @@ fn try_create_array_kv(
     reservation.try_grow(mem_size)?;
     metrics.build_mem_used.add(mem_size);
 
-    let array_kv = ArrayKV::try_new(left_values, offset_val, size)?;
+    let array_kv = ArrayKV::try_new(&left_values[0], offset_val, size)?;
     if array_kv.is_none() {
         reservation.shrink(mem_size);
         metrics.build_mem_used.sub(mem_size);
     }
     Ok(array_kv)
 }
-
-
 
 /// HashTable and input data for the left (build side) of a join
 pub(super) struct JoinLeftData {

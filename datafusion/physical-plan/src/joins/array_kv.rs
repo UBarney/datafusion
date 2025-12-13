@@ -20,13 +20,13 @@ use std::sync::Arc;
 
 use crate::joins::join_hash_map::JoinHashMapOffset;
 use crate::joins::utils::JoinHashMapType;
-use arrow::array::{ArrayRef, AsArray};
-use arrow::datatypes::{
-    Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type,
-    UInt8Type,
-};
+use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::DataType;
-use datafusion_common::{internal_err, Result};
+use arrow::datatypes::{
+    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type,
+    UInt64Type,
+};
+use datafusion_common::{Result, internal_err};
 
 pub struct ArrayKV {
     data: Vec<u64>,
@@ -43,14 +43,12 @@ impl ArrayKV {
     }
 
     pub(crate) fn try_new(
-        left_values: &[ArrayRef],
+        array: &ArrayRef,
         offset_val: u64,
         size: usize,
     ) -> Result<Option<Self>> {
         // Initialize with 0 (sentinel for not found)
         let mut data = vec![0; size];
-
-        let array = &left_values[0];
 
         macro_rules! fill_data {
             ($ARR_TYPE:ty) => {{
@@ -96,71 +94,71 @@ impl ArrayKV {
         }))
     }
 
-    pub fn process_prob_side(
+    pub fn get_matched_indices_with_limit_offset(
         &self,
-        keys_values: &[ArrayRef],
-        prob_side_buffer: &mut Vec<u64>,
-    ) -> Result<()> {
-        assert_eq!(1, keys_values.len());
-        let array = &keys_values[0];
+        prob_side_keys: &[ArrayRef],
+        batch_size: usize,
+        current_offset: JoinHashMapOffset,
+        input_indices: &mut Vec<u32>,
+        match_indices: &mut Vec<u64>,
+    ) -> Result<Option<JoinHashMapOffset>> {
+        input_indices.clear();
+        match_indices.clear();
 
-        macro_rules! fill_buffer {
+        if prob_side_keys.len() != 1 {
+            return internal_err!(
+                "ArrayKV join expects 1 join key, but got {}",
+                prob_side_keys.len()
+            );
+        }
+        let array = &prob_side_keys[0];
+
+        let end = (current_offset.0 + batch_size).min(array.len());
+
+        macro_rules! lookup {
             ($ARR_TYPE:ty) => {{
                 let arr = array.as_primitive::<$ARR_TYPE>();
-                for (i, val) in arr.values().iter().enumerate() {
-                    prob_side_buffer[i] = *val as u64;
+                for prob_idx in current_offset.0..end {
+                    if arr.is_null(prob_idx) {
+                        continue;
+                    }
+                    // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
+                    let prob_val = unsafe { arr.value_unchecked(prob_idx) } as u64;
+                    let idx_in_build_side =
+                        (prob_val.wrapping_sub(self.offset())) as usize;
+
+                    if idx_in_build_side >= self.data().len()
+                        || self.data()[idx_in_build_side] == 0
+                    {
+                        continue;
+                    }
+                    match_indices.push(self.data()[idx_in_build_side] - 1);
+                    input_indices.push(prob_idx as u32);
                 }
             }};
         }
 
         match array.data_type() {
-            DataType::Int8 => fill_buffer!(Int8Type),
-            DataType::Int16 => fill_buffer!(Int16Type),
-            DataType::Int32 => fill_buffer!(Int32Type),
-            DataType::Int64 => fill_buffer!(Int64Type),
-            DataType::UInt8 => fill_buffer!(UInt8Type),
-            DataType::UInt16 => fill_buffer!(UInt16Type),
-            DataType::UInt32 => fill_buffer!(UInt32Type),
-            DataType::UInt64 => fill_buffer!(UInt64Type),
-            _ => internal_err!(
-                "Unsupported data type for ArrayKV join: {:?}",
-                array.data_type()
-            )?,
-        }
-        Ok(())
-    }
-
-    pub fn get_matched_indices_with_limit_offset(
-        &self,
-        prob_side_buffer: &[u64],
-        batch_size: usize,
-        current_offset: JoinHashMapOffset,
-        input_indices: &mut Vec<u32>,
-        match_indices: &mut Vec<u64>,
-    ) -> Option<JoinHashMapOffset> {
-        input_indices.clear();
-        match_indices.clear();
-
-        let end = (current_offset.0 + batch_size).min(prob_side_buffer.len());
-
-        for (prob_idx, prob_val) in
-            prob_side_buffer[current_offset.0..end].iter().enumerate()
-        {
-            let idx_in_build_side = (prob_val.wrapping_sub(self.offset())) as usize;
-
-            if idx_in_build_side >= self.data().len()
-                || self.data()[idx_in_build_side] == 0
-            {
-                continue;
+            DataType::Int8 => lookup!(Int8Type),
+            DataType::Int16 => lookup!(Int16Type),
+            DataType::Int32 => lookup!(Int32Type),
+            DataType::Int64 => lookup!(Int64Type),
+            DataType::UInt8 => lookup!(UInt8Type),
+            DataType::UInt16 => lookup!(UInt16Type),
+            DataType::UInt32 => lookup!(UInt32Type),
+            DataType::UInt64 => lookup!(UInt64Type),
+            _ => {
+                return internal_err!(
+                    "Unsupported type for ArrayKV lookup: {:?}",
+                    array.data_type()
+                );
             }
-            match_indices.push(self.data()[idx_in_build_side] - 1);
-            input_indices.push((prob_idx + current_offset.0) as u32);
         }
 
-        if end == prob_side_buffer.len() {
-            None
+        if end == array.len() {
+            Ok(None)
         } else {
-            Some((end, None))
+            Ok(Some((end, None)))
         }
     }
 }
