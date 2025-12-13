@@ -26,7 +26,7 @@ use arrow::datatypes::{
     Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type,
     UInt64Type,
 };
-use datafusion_common::{internal_err, NullEquality, Result};
+use datafusion_common::{internal_err, Result};
 
 /// A "perfect" hash map for single-column integer join keys, represented as a dense array.
 ///

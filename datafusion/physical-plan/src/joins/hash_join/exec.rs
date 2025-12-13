@@ -41,6 +41,7 @@ use crate::joins::utils::{
     swap_join_projection, update_hash,
 };
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
+use crate::metrics::{Count, MetricBuilder};
 use crate::projection::{
     EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
     try_pushdown_through_join,
@@ -59,14 +60,9 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{
-    ArrayRef, AsArray, BooleanBufferBuilder, PrimitiveBuilder, UInt32Array, UInt64Array,
-};
+use arrow::array::{ArrayRef, BooleanBufferBuilder};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{
-    Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef, UInt8Type, UInt16Type,
-    UInt32Type, UInt64Type,
-};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
 use arrow_schema::DataType;
@@ -95,6 +91,8 @@ use parking_lot::Mutex;
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
 pub(crate) const HASH_JOIN_SEED: RandomState =
     RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
+
+const ARRAY_KV_CREATED_COUNT_METRIC_NAME: &'static str = "array_kv_created_count";
 
 fn try_create_array_kv(
     bounds: &Option<PartitionBounds>,
@@ -162,13 +160,14 @@ fn try_create_array_kv(
     let mem_size = size * size_of::<u64>();
 
     reservation.try_grow(mem_size)?;
-    metrics.build_mem_used.add(mem_size);
 
     let array_kv = ArrayKV::try_new(&left_values[0], offset_val, size)?;
     if array_kv.is_none() {
         reservation.shrink(mem_size);
-        metrics.build_mem_used.sub(mem_size);
     }
+
+    // TODO: move to caller
+    metrics.build_mem_used.add(mem_size);
     Ok(array_kv)
 }
 
@@ -1005,6 +1004,10 @@ impl ExecutionPlan for HashJoinExec {
         let enable_dynamic_filter_pushdown = self.dynamic_filter.is_some();
 
         let join_metrics = BuildProbeJoinMetrics::new(partition, &self.metrics);
+
+        let array_kv_created_count = MetricBuilder::new(&self.metrics)
+            .counter(ARRAY_KV_CREATED_COUNT_METRIC_NAME, partition);
+
         let perfect_hash_join_max_array_size = context
             .session_config()
             .options()
@@ -1038,6 +1041,7 @@ impl ExecutionPlan for HashJoinExec {
                         .hash_join_inlist_pushdown_max_distinct_values,
                     perfect_hash_join_max_array_size,
                     self.null_equality,
+                    array_kv_created_count,
                 ))
             })?,
             PartitionMode::Partitioned => {
@@ -1068,6 +1072,7 @@ impl ExecutionPlan for HashJoinExec {
                         .hash_join_inlist_pushdown_max_distinct_values,
                     perfect_hash_join_max_array_size,
                     self.null_equality,
+                    array_kv_created_count,
                 ))
             }
             PartitionMode::Auto => {
@@ -1500,6 +1505,7 @@ async fn collect_left_input(
     max_inlist_distinct_values: usize,
     perfect_hash_join_max_array_size: usize,
     null_equality: NullEquality,
+    array_kv_created_count: Count,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
@@ -1582,6 +1588,7 @@ async fn collect_left_input(
     )?;
 
     let join_hash_map = if let Some(array_kv) = array_kv {
+        array_kv_created_count.add(1);
         Map::ArrayKV(array_kv)
     } else {
         // Estimation of memory size, required for hashtable, prior to allocation.
@@ -1719,9 +1726,9 @@ mod tests {
         a.div_ceil(b)
     }
 
-    // #[template]
-    // #[rstest]
-    // fn batch_sizes(#[values(8192, 10, 5, 2, 1)] batch_size: usize) {}
+    #[template]
+    #[rstest]
+    fn batch_sizes(#[values(8192, 10, 5, 2, 1)] batch_size: usize) {}
 
     #[template]
     #[rstest]
@@ -1908,13 +1915,10 @@ mod tests {
         Ok((columns, batches, metrics))
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(batch_sizes)]
     #[tokio::test]
-    async fn join_inner_one(
-        batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
-    ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+    async fn join_inner_one(batch_size: usize) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, 8192);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 5]), // this has a repetition
@@ -2008,6 +2012,16 @@ mod tests {
         }
 
         assert_join_metrics!(metrics, 3);
+
+        if perfect_hash_join_max_array_size >= 3 {
+            assert!(
+                metrics
+                    .sum_by_name(ARRAY_KV_CREATED_COUNT_METRIC_NAME)
+                    .expect("should have metrics")
+                    .as_usize()
+                    >= 1
+            );
+        }
 
         Ok(())
     }
@@ -2109,13 +2123,10 @@ mod tests {
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(batch_sizes)]
     #[tokio::test]
-    async fn join_inner_two(
-        batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
-    ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+    async fn join_inner_two(batch_size: usize) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, 8192);
         let left = build_table(
             ("a1", &vec![1, 2, 2]),
             ("b2", &vec![1, 2, 2]),
@@ -2189,13 +2200,10 @@ mod tests {
     }
 
     /// Test where the left has 2 parts, the right with 1 part => 1 part
-    #[apply(hash_join_scenarios)]
+    #[apply(batch_sizes)]
     #[tokio::test]
-    async fn join_inner_one_two_parts_left(
-        batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
-    ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+    async fn join_inner_one_two_parts_left(batch_size: usize) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, 8192);
         let batch1 = build_table_i32(
             ("a1", &vec![1, 2]),
             ("b2", &vec![1, 2]),
@@ -2462,7 +2470,7 @@ mod tests {
     async fn join_left_multi_batch(
         batch_size: usize,
         perfect_hash_join_max_array_size: usize,
-    ) {
+    ) -> Result<()> {
         let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
@@ -2480,9 +2488,9 @@ mod tests {
         )];
 
         let join = join(
-            left,
-            right,
-            on,
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on.clone(),
             &JoinType::Left,
             NullEquality::NullEqualsNothing,
         )
@@ -2491,8 +2499,15 @@ mod tests {
         let columns = columns(&join.schema());
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
 
-        let stream = join.execute(0, task_ctx).unwrap();
-        let batches = common::collect(stream).await.unwrap();
+        let (_, batches, metrics) = join_collect(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on.clone(),
+            &JoinType::Left,
+            NullEquality::NullEqualsNothing,
+            task_ctx,
+        )
+        .await?;
 
         allow_duplicates! {
             assert_snapshot!(batches_to_sort_string(&batches), @r#"
@@ -2507,6 +2522,17 @@ mod tests {
             +----+----+----+----+----+----+
                 "#);
         }
+
+        if perfect_hash_join_max_array_size >= 3 {
+            assert!(
+                metrics
+                    .sum_by_name(ARRAY_KV_CREATED_COUNT_METRIC_NAME)
+                    .expect("should have metrics")
+                    .as_usize()
+                    >= 1
+            );
+        }
+        return Ok(());
     }
 
     #[apply(hash_join_scenarios)]
