@@ -469,7 +469,7 @@ config_namespace! {
         pub batch_size: usize, default = 8192
 
         /// Maximum array size for perfect hash join.
-        pub perfect_hash_join_max_array_size: usize, default = 819200
+        pub perfect_hash_join_max_array_size: usize, default = 1024
 
         /// When set to true, record batches will be examined between each operator and
         /// small batches will be coalesced into larger batches. This is helpful when there

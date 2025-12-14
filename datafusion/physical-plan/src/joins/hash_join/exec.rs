@@ -86,6 +86,7 @@ use ahash::RandomState;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::TryStreamExt;
+use log::debug;
 use parking_lot::Mutex;
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
@@ -102,7 +103,7 @@ fn try_create_array_kv(
     max_array_size: usize,
     null_equality: NullEquality,
 ) -> Result<Option<ArrayKV>> {
-    if !(left_values.len() == 1 && left_values[0].len() <= max_array_size) {
+    if left_values.len() != 1 || left_values[0].len() == 0 {
         return Ok(None);
     }
 
@@ -150,7 +151,17 @@ fn try_create_array_kv(
     }
 
     let range = max_val - min_val;
-    if range > max_array_size as i128 {
+    let dense_ratio = (left_values[0].len() as f64) / (range as f64);
+    if dense_ratio > 0.99 {
+        debug!(
+            "dense! ratio: {}, range: {}, len: {}",
+            dense_ratio,
+            range,
+            left_values[0].len()
+        );
+    }
+
+    if range > max_array_size as i128 && dense_ratio < 0.9 {
         return Ok(None);
     }
 
@@ -165,6 +176,8 @@ fn try_create_array_kv(
     if array_kv.is_none() {
         reservation.shrink(mem_size);
     }
+
+    // dbg!("range:{} left_len:{} ", range, left_values[0].len());
 
     // TODO: move to caller
     metrics.build_mem_used.add(mem_size);
