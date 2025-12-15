@@ -35,6 +35,7 @@ mod sort_merge_join;
 mod stream_join_utils;
 mod symmetric_hash_join;
 pub mod utils;
+pub mod chain;
 
 mod join_filter;
 mod join_hash_map;

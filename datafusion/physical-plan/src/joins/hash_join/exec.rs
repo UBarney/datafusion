@@ -167,6 +167,7 @@ fn try_create_array_kv(
 
     let offset_val = min_val as u64;
 
+    // todo: move compute mem usage to ArrayKV
     let size = (range + 1) as usize;
     let mem_size = size * size_of::<u64>();
 
