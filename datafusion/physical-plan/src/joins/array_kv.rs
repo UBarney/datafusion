@@ -50,13 +50,13 @@ use datafusion_common::{Result, internal_err};
 /// build side contains `NULL`s, as it does not have a mechanism to store and match `NULL` values.
 #[derive(Debug)]
 pub struct ArrayKV {
-    data: Vec<u64>,
+    data: Vec<u32>,
     offset: u64,
-    next: Option<Vec<u64>>,
+    next: Option<Vec<u32>>,
 }
 
 impl ArrayKV {
-    pub fn data(&self) -> &[u64] {
+    pub fn data(&self) -> &[u32] {
         &self.data
     }
 
@@ -77,8 +77,8 @@ impl ArrayKV {
         range: usize,
     ) -> Result<Option<Self>> {
         // Initialize with 0 (sentinel for not found)
-        let mut data: Vec<u64> = vec![0; range];
-        let mut next: Option<Vec<u64>> = None;
+        let mut data: Vec<u32> = vec![0; range];
+        let mut next: Option<Vec<u32>> = None;
 
         macro_rules! fill_data {
             ($ARR_TYPE:ty) => {{
@@ -99,7 +99,7 @@ impl ArrayKV {
                             }
                             next.as_mut().unwrap()[i] = data[idx]
                         }
-                        data[idx] = (i) as u64 + 1;
+                        data[idx] = (i) as u32 + 1;
                     }
                 }
             }};
@@ -137,9 +137,6 @@ impl ArrayKV {
         probe_indices: &mut Vec<u32>,
         build_indices: &mut Vec<u64>,
     ) -> Result<Option<JoinHashMapOffset>> {
-        probe_indices.clear();
-        build_indices.clear();
-
         if prob_side_keys.len() != 1 {
             return internal_err!(
                 "ArrayKV join expects 1 join key, but got {}",
@@ -225,7 +222,14 @@ impl ArrayKV {
     where
         T::Native: Copy + AsPrimitive<u64>,
     {
+        probe_indices.clear();
+        build_indices.clear();
+        // let (prob_cap, build_cap) = (probe_indices.capacity(), build_indices.capacity());
+
         let arr = array.as_primitive::<T>();
+
+        // arr.values().get_unchecked(index)
+
         if self.next.is_none() {
             let end = (current_offset.0 + limit).min(arr.len());
             for prob_idx in current_offset.0..end {
@@ -241,7 +245,7 @@ impl ArrayKV {
                 {
                     continue;
                 }
-                build_indices.push(self.data()[idx_in_build_side] - 1);
+                build_indices.push((self.data()[idx_in_build_side] - 1) as u64);
                 probe_indices.push(prob_idx as u32);
             }
             if end == array.len() {
@@ -264,7 +268,7 @@ impl ArrayKV {
                     if let Some(next_offset) = traverse_chain(
                         self.next.as_ref().unwrap(),
                         idx,
-                        next_idx,
+                        next_idx as u32, // Cast u64 to u32
                         &mut remaining_output,
                         probe_indices,
                         build_indices,
@@ -301,7 +305,7 @@ impl ArrayKV {
                 if let Some(offset) = traverse_chain(
                     self.next.as_ref().unwrap(),
                     prob_side_idx,
-                    build_idx,
+                    build_idx, // Pass u32 directly
                     &mut remaining_output,
                     probe_indices,
                     build_indices,
