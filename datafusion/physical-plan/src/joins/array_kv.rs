@@ -48,6 +48,7 @@ use datafusion_common::{Result, internal_err};
 ///
 /// This structure **cannot** be used for joins with `NullEquality::NullEqualsNull` if the
 /// build side contains `NULL`s, as it does not have a mechanism to store and match `NULL` values.
+#[derive(Debug)]
 pub struct ArrayKV {
     data: Vec<u64>,
     offset: u64,
@@ -541,6 +542,57 @@ mod tests {
         assert_eq!(prob_indices, vec![4]);
         assert_eq!(build_indices, vec![8]);
         assert!(result_offset.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_kv_with_limit_from_user() -> Result<()> {
+        // buildSide: `[1, 3, 5, 7, 8, 8, 10]`
+        // probSide: `[8, 10, 6, 2, 10, 4]`
+        // limit: 2
+        let build_array: ArrayRef =
+            Arc::new(Int32Array::from(vec![1, 3, 5, 7, 8, 8, 10]));
+        // min value is 1, max is 10.
+        let offset_val = 1;
+        let range = 10;
+        let array_kv = ArrayKV::try_new(&build_array, offset_val, range)?
+            .expect("should create ArrayKV");
+
+        let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![8, 10, 6, 2, 10, 4]));
+        let prob_side_keys = [probe_array.clone()];
+
+        let mut prob_indices = Vec::new();
+        let mut build_indices = Vec::new();
+        let mut all_prob_indices: Vec<u32> = Vec::new();
+        let mut all_build_indices: Vec<u64> = Vec::new();
+        let batch_size = 2;
+        let mut current_offset = Some((0 as usize, None::<u64>));
+
+        // Expected matches (probe_idx, build_idx):
+        // (0, 4), (0, 5) from probe key 8
+        // (1, 6) from probe key 10
+        // (4, 6) from probe key 10
+
+        // Loop until all matches are found
+        while let Some(offset) = current_offset {
+            let result_offset = array_kv.get_matched_indices_with_limit_offset(
+                &prob_side_keys,
+                batch_size,
+                offset,
+                &mut prob_indices,
+                &mut build_indices,
+            )?;
+            all_prob_indices.extend(&prob_indices);
+            all_build_indices.extend(&build_indices);
+            current_offset = result_offset;
+        }
+
+        let expected_prob = vec![0, 0, 1, 4];
+        let expected_build = vec![4, 5, 6, 6];
+
+        assert_eq!(all_prob_indices, expected_prob);
+        assert_eq!(all_build_indices, expected_build);
 
         Ok(())
     }
