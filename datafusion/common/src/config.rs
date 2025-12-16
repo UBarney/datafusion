@@ -471,6 +471,12 @@ config_namespace! {
         /// Maximum array size for perfect hash join.
         pub perfect_hash_join_max_array_size: usize, default = 1024
 
+        /// The dense ratio threshold for perfect hash join.
+        ///
+        /// If the ratio of the number of rows to the range of join keys is greater
+        /// than this value, DataFusion will use a perfect hash join.
+        pub perfect_hash_join_dense_ratio_threshold: f64, default = 0.99
+
         /// When set to true, record batches will be examined between each operator and
         /// small batches will be coalesced into larger batches. This is helpful when there
         /// are highly selective filters or joins that could produce tiny output batches. The

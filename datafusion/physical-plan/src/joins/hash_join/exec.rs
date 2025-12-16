@@ -103,6 +103,7 @@ fn try_create_array_kv(
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
     max_array_size: usize,
+    dense_ratio_threshold: f64,
     null_equality: NullEquality,
 ) -> Result<Option<(ArrayKV, RecordBatch, Vec<ArrayRef>)>> {
     if on_left.len() != 1 {
@@ -158,7 +159,7 @@ fn try_create_array_kv(
     let range = max_val - min_val;
     let num_row: usize = batches.iter().map(|x| x.num_rows()).sum();
     let dense_ratio = (num_row as f64) / (range as f64);
-    if dense_ratio > 0.99 {
+    if dense_ratio > dense_ratio_threshold {
         debug!(
             "dense! ratio: {}, range: {}, len: {}",
             dense_ratio, range, num_row
@@ -1052,6 +1053,11 @@ impl ExecutionPlan for HashJoinExec {
             .options()
             .execution
             .perfect_hash_join_max_array_size;
+        let perfect_hash_join_dense_ratio_threshold = context
+            .session_config()
+            .options()
+            .execution
+            .perfect_hash_join_dense_ratio_threshold;
         let left_fut = match self.mode {
             PartitionMode::CollectLeft => self.left_fut.try_once(|| {
                 let left_stream = self.left.execute(0, Arc::clone(&context))?;
@@ -1079,6 +1085,7 @@ impl ExecutionPlan for HashJoinExec {
                         .optimizer
                         .hash_join_inlist_pushdown_max_distinct_values,
                     perfect_hash_join_max_array_size,
+                    perfect_hash_join_dense_ratio_threshold,
                     self.null_equality,
                     array_kv_created_count,
                 ))
@@ -1110,6 +1117,7 @@ impl ExecutionPlan for HashJoinExec {
                         .optimizer
                         .hash_join_inlist_pushdown_max_distinct_values,
                     perfect_hash_join_max_array_size,
+                    perfect_hash_join_dense_ratio_threshold,
                     self.null_equality,
                     array_kv_created_count,
                 ))
@@ -1480,9 +1488,9 @@ impl BuildSideState {
 fn should_collect_min_max_for_perfect_hash(
     on_left: &[PhysicalExprRef],
     schema: &SchemaRef,
-    perfect_hash_join_max_array_size: usize,
+    use_perfect_hash_join_as_possible: usize,
 ) -> Result<bool> {
-    if on_left.len() != 1 || perfect_hash_join_max_array_size == 0 {
+    if on_left.len() != 1 || use_perfect_hash_join_as_possible == 0 {
         return Ok(false);
     }
 
@@ -1542,7 +1550,8 @@ async fn collect_left_input(
     should_compute_dynamic_filters: bool,
     max_inlist_size: usize,
     max_inlist_distinct_values: usize,
-    perfect_hash_join_max_array_size: usize,
+    use_perfect_hash_join_as_possible: usize,
+    dense_ratio_threshold: f64,
     null_equality: NullEquality,
     array_kv_created_count: Count,
 ) -> Result<JoinLeftData> {
@@ -1551,7 +1560,7 @@ async fn collect_left_input(
     let should_collect_for_perfect_hash = should_collect_min_max_for_perfect_hash(
         &on_left,
         &schema,
-        perfect_hash_join_max_array_size,
+        use_perfect_hash_join_as_possible,
     )?;
     // This operation performs 2 steps at once:
     // 1. creates a [JoinHashMap] of all batches from the stream
@@ -1620,7 +1629,8 @@ async fn collect_left_input(
             &on_left,
             &mut reservation,
             &metrics,
-            perfect_hash_join_max_array_size,
+            use_perfect_hash_join_as_possible,
+            dense_ratio_threshold,
             null_equality,
         )? {
         array_kv_created_count.add(1);
@@ -1772,19 +1782,35 @@ mod tests {
     fn hash_join_scenarios(
         //TODO: better name
         #[values(8192, 10, 5, 2, 1)] batch_size: usize,
-        #[values(0, 8192)] perfect_hash_join_max_array_size: usize,
+        #[values(true, false)] use_perfect_hash_join_as_possible: bool,
     ) {
     }
 
     fn prepare_task_ctx(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Arc<TaskContext> {
         let mut session_config = SessionConfig::default().with_batch_size(batch_size);
-        session_config
-            .options_mut()
-            .execution
-            .perfect_hash_join_max_array_size = perfect_hash_join_max_array_size;
+
+        if use_perfect_hash_join_as_possible {
+            session_config
+                .options_mut()
+                .execution
+                .perfect_hash_join_max_array_size = 819200;
+            session_config
+                .options_mut()
+                .execution
+                .perfect_hash_join_dense_ratio_threshold = 0.0;
+        } else {
+            session_config
+                .options_mut()
+                .execution
+                .perfect_hash_join_max_array_size = 0;
+            session_config
+                .options_mut()
+                .execution
+                .perfect_hash_join_dense_ratio_threshold = 1.0 / 0.0;
+        }
         Arc::new(TaskContext::default().with_session_config(session_config))
     }
 
@@ -1952,10 +1978,13 @@ mod tests {
         Ok((columns, batches, metrics))
     }
 
-    #[apply(batch_sizes)]
+    #[apply(hash_join_scenarios)]
     #[tokio::test]
-    async fn join_inner_one(batch_size: usize) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, 8192);
+    async fn join_inner_one(
+        batch_size: usize,
+        use_perfect_hash_join_as_possible: bool,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 5]), // this has a repetition
@@ -2006,9 +2035,9 @@ mod tests {
     #[tokio::test]
     async fn partitioned_join_inner_one(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 5]), // this has a repetition
@@ -2050,11 +2079,11 @@ mod tests {
 
         assert_join_metrics!(metrics, 3);
 
-        if perfect_hash_join_max_array_size >= 3 {
+        if use_perfect_hash_join_as_possible {
             assert!(
                 metrics
                     .sum_by_name(ARRAY_KV_CREATED_COUNT_METRIC_NAME)
-                    .expect("should have metrics")
+                    .expect("should have ARRAY_KV_CREATED_COUNT_METRIC_NAME metrics")
                     .as_usize()
                     >= 1
             );
@@ -2160,10 +2189,13 @@ mod tests {
         Ok(())
     }
 
-    #[apply(batch_sizes)]
+    #[apply(hash_join_scenarios)]
     #[tokio::test]
-    async fn join_inner_two(batch_size: usize) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, 8192);
+    async fn join_inner_two(
+        batch_size: usize,
+        use_perfect_hash_join_as_possible: bool,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 2]),
             ("b2", &vec![1, 2, 2]),
@@ -2237,10 +2269,13 @@ mod tests {
     }
 
     /// Test where the left has 2 parts, the right with 1 part => 1 part
-    #[apply(batch_sizes)]
+    #[apply(hash_join_scenarios)]
     #[tokio::test]
-    async fn join_inner_one_two_parts_left(batch_size: usize) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, 8192);
+    async fn join_inner_one_two_parts_left(
+        batch_size: usize,
+        use_perfect_hash_join_as_possible: bool,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let batch1 = build_table_i32(
             ("a1", &vec![1, 2]),
             ("b2", &vec![1, 2]),
@@ -2386,9 +2421,9 @@ mod tests {
     #[tokio::test]
     async fn join_inner_one_two_parts_right(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 5]), // this has a repetition
@@ -2506,9 +2541,9 @@ mod tests {
     #[tokio::test]
     async fn join_left_multi_batch(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]), // 7 does not exist on the right
@@ -2560,7 +2595,7 @@ mod tests {
                 "#);
         }
 
-        if perfect_hash_join_max_array_size >= 3 {
+        if use_perfect_hash_join_as_possible {
             assert!(
                 metrics
                     .sum_by_name(ARRAY_KV_CREATED_COUNT_METRIC_NAME)
@@ -2576,9 +2611,9 @@ mod tests {
     #[tokio::test]
     async fn join_full_multi_batch(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]), // 7 does not exist on the right
@@ -2631,9 +2666,9 @@ mod tests {
     #[tokio::test]
     async fn join_left_empty_right(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]),
@@ -2678,9 +2713,9 @@ mod tests {
     #[tokio::test]
     async fn join_full_empty_right(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]),
@@ -2725,9 +2760,9 @@ mod tests {
     #[tokio::test]
     async fn join_left_one(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]), // 7 does not exist on the right
@@ -2776,9 +2811,9 @@ mod tests {
     #[tokio::test]
     async fn partitioned_join_left_one(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]), // 7 does not exist on the right
@@ -2847,9 +2882,9 @@ mod tests {
     #[tokio::test]
     async fn join_left_semi(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_semi_anti_left_table();
         let right = build_semi_anti_right_table();
         // left_table left semi join right_table on left_table.b1 = right_table.b2
@@ -2892,9 +2927,9 @@ mod tests {
     #[tokio::test]
     async fn join_left_semi_with_filter(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_semi_anti_left_table();
         let right = build_semi_anti_right_table();
 
@@ -2994,9 +3029,9 @@ mod tests {
     #[tokio::test]
     async fn join_right_semi(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_semi_anti_left_table();
         let right = build_semi_anti_right_table();
 
@@ -3040,9 +3075,9 @@ mod tests {
     #[tokio::test]
     async fn join_right_semi_with_filter(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_semi_anti_left_table();
         let right = build_semi_anti_right_table();
 
@@ -3142,9 +3177,9 @@ mod tests {
     #[tokio::test]
     async fn join_left_anti(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_semi_anti_left_table();
         let right = build_semi_anti_right_table();
         // left_table left anti join right_table on left_table.b1 = right_table.b2
@@ -3186,9 +3221,9 @@ mod tests {
     #[tokio::test]
     async fn join_left_anti_with_filter(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_semi_anti_left_table();
         let right = build_semi_anti_right_table();
         // left_table left anti join right_table on left_table.b1 = right_table.b2 and right_table.a2!=8
@@ -3295,9 +3330,9 @@ mod tests {
     #[tokio::test]
     async fn join_right_anti(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_semi_anti_left_table();
         let right = build_semi_anti_right_table();
         let on = vec![(
@@ -3338,9 +3373,9 @@ mod tests {
     #[tokio::test]
     async fn join_right_anti_with_filter(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_semi_anti_left_table();
         let right = build_semi_anti_right_table();
         // left_table right anti join right_table on left_table.b1 = right_table.b2 and left_table.a1!=13
@@ -3451,9 +3486,9 @@ mod tests {
     #[tokio::test]
     async fn join_right_one(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]),
@@ -3502,9 +3537,9 @@ mod tests {
     #[tokio::test]
     async fn partitioned_join_right_one(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]),
@@ -3553,9 +3588,9 @@ mod tests {
     #[tokio::test]
     async fn join_full_one(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]), // 7 does not exist on the right
@@ -3605,9 +3640,9 @@ mod tests {
     #[tokio::test]
     async fn join_left_mark(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]), // 7 does not exist on the right
@@ -3656,9 +3691,9 @@ mod tests {
     #[tokio::test]
     async fn partitioned_join_left_mark(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]), // 7 does not exist on the right
@@ -3707,9 +3742,9 @@ mod tests {
     #[tokio::test]
     async fn join_right_mark(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]), // 7 does not exist on the right
@@ -3757,9 +3792,9 @@ mod tests {
     #[tokio::test]
     async fn partitioned_join_right_mark(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 7]), // 7 does not exist on the right
@@ -4010,9 +4045,9 @@ mod tests {
     #[tokio::test]
     async fn join_inner_with_filter(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a", &vec![0, 1, 2, 2]),
             ("b", &vec![4, 5, 7, 8]),
@@ -4062,9 +4097,9 @@ mod tests {
     #[tokio::test]
     async fn join_left_with_filter(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a", &vec![0, 1, 2, 2]),
             ("b", &vec![4, 5, 7, 8]),
@@ -4117,9 +4152,9 @@ mod tests {
     #[tokio::test]
     async fn join_right_with_filter(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a", &vec![0, 1, 2, 2]),
             ("b", &vec![4, 5, 7, 8]),
@@ -4171,9 +4206,9 @@ mod tests {
     #[tokio::test]
     async fn join_full_with_filter(
         batch_size: usize,
-        perfect_hash_join_max_array_size: usize,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, perfect_hash_join_max_array_size);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a", &vec![0, 1, 2, 2]),
             ("b", &vec![4, 5, 7, 8]),
@@ -4569,7 +4604,7 @@ mod tests {
         // validation of partial join results output for different batch_size setting
         for join_type in join_types {
             for batch_size in (1..21).rev() {
-                let task_ctx = prepare_task_ctx(batch_size, 8192);
+                let task_ctx = prepare_task_ctx(batch_size, true);
 
                 let join = join(
                     Arc::clone(&left),
