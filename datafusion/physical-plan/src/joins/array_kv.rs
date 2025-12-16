@@ -276,8 +276,7 @@ impl ArrayKV {
                 }
             };
 
-            let end = arr.len().min(to_skip + limit);
-            for prob_side_idx in to_skip..end {
+            for prob_side_idx in to_skip..arr.len() {
                 if remaining_output == 0 {
                     return Ok(Some((prob_side_idx, None)));
                 }

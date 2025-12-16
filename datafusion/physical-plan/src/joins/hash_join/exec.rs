@@ -60,7 +60,7 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{ArrayRef, BooleanBufferBuilder};
+use arrow::array::{ArrayRef, BooleanBufferBuilder, Int32Array};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -97,20 +97,25 @@ const ARRAY_KV_CREATED_COUNT_METRIC_NAME: &'static str = "array_kv_created_count
 
 fn try_create_array_kv(
     bounds: &Option<PartitionBounds>,
-    left_values: &[ArrayRef],
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    on_left: &[PhysicalExprRef],
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
     max_array_size: usize,
     null_equality: NullEquality,
-) -> Result<Option<ArrayKV>> {
-    if left_values.len() != 1 || left_values[0].len() == 0 {
+) -> Result<Option<(ArrayKV, RecordBatch, Vec<ArrayRef>)>> {
+    if on_left.len() != 1 {
         return Ok(None);
     }
 
-    let left_values_have_null = left_values[0].null_count() > 0;
-
-    if null_equality == NullEquality::NullEqualsNull && left_values_have_null {
-        return Ok(None);
+    if null_equality == NullEquality::NullEqualsNull {
+        for batch in batches.iter() {
+            let arrays = evaluate_expressions_to_arrays(on_left, batch)?;
+            if arrays[0].null_count() > 0 {
+                return Ok(None);
+            }
+        }
     }
 
     let min_max = bounds
@@ -151,13 +156,12 @@ fn try_create_array_kv(
     }
 
     let range = max_val - min_val;
-    let dense_ratio = (left_values[0].len() as f64) / (range as f64);
+    let num_row: usize = batches.iter().map(|x| x.num_rows()).sum();
+    let dense_ratio = (num_row as f64) / (range as f64);
     if dense_ratio > 0.99 {
         debug!(
             "dense! ratio: {}, range: {}, len: {}",
-            dense_ratio,
-            range,
-            left_values[0].len()
+            dense_ratio, range, num_row
         );
     }
 
@@ -173,16 +177,37 @@ fn try_create_array_kv(
 
     reservation.try_grow(mem_size)?;
 
+    let batch = concat_batches(&schema, batches)?;
+    let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+
     let array_kv = ArrayKV::try_new(&left_values[0], offset_val, size)?;
-    if array_kv.is_none() {
-        reservation.shrink(mem_size);
+
+    match array_kv {
+        Some(array_kv) => {
+            // TODO: move to caller
+            metrics.build_mem_used.add(mem_size);
+            {
+                let mut probe_indices = Vec::with_capacity(1000);
+                let mut build_indices = Vec::with_capacity(1000);
+
+                let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![10]));
+
+                let r = array_kv.get_matched_indices_with_limit_offset(
+                    &[probe_array],
+                    1000,
+                    (0, None),
+                    &mut probe_indices,
+                    &mut build_indices,
+                );
+                // dbg!(build_indices, &left_values[0], offset_val, range, &array_kv);
+            }
+            Ok(Some((array_kv, batch, left_values)))
+        }
+        None => {
+            reservation.shrink(mem_size);
+            Ok(None)
+        }
     }
-
-    // dbg!("range:{} left_len:{} ", range, left_values[0].len());
-
-    // TODO: move to caller
-    metrics.build_mem_used.add(mem_size);
-    Ok(array_kv)
 }
 
 /// HashTable and input data for the left (build side) of a join
@@ -1575,11 +1600,6 @@ async fn collect_left_input(
 
     let batches_iter = batches.iter().rev();
 
-    // Merge all batches into a single batch, so we can directly index into the arrays
-    let batch = concat_batches(&schema, batches_iter.clone())?;
-
-    let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
-
     // Compute bounds for dynamic filter if enabled
     let bounds = match bounds_accumulators {
         Some(accumulators) if num_rows > 0 => {
@@ -1592,18 +1612,19 @@ async fn collect_left_input(
         _ => None,
     };
 
-    let array_kv = try_create_array_kv(
-        &bounds,
-        &left_values,
-        &mut reservation,
-        &metrics,
-        perfect_hash_join_max_array_size,
-        null_equality,
-    )?;
-
-    let join_hash_map = if let Some(array_kv) = array_kv {
+    let (join_hash_map, batch, left_values) = if let Some((array_kv, batch, left_value)) =
+        try_create_array_kv(
+            &bounds,
+            &schema,
+            &batches,
+            &on_left,
+            &mut reservation,
+            &metrics,
+            perfect_hash_join_max_array_size,
+            null_equality,
+        )? {
         array_kv_created_count.add(1);
-        Map::ArrayKV(array_kv)
+        (Map::ArrayKV(array_kv), batch, left_value)
     } else {
         // Estimation of memory size, required for hashtable, prior to allocation.
         // Final result can be verified using `RawTable.allocation_info()`
@@ -1647,7 +1668,11 @@ async fn collect_left_input(
             offset += batch.num_rows();
         }
 
-        Map::HashMap(hashmap.into())
+        let batch = concat_batches(&schema, batches_iter.clone())?;
+
+        let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+
+        (Map::HashMap(hashmap.into()), batch, left_values)
     };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
@@ -1662,8 +1687,6 @@ async fn collect_left_input(
     } else {
         BooleanBufferBuilder::new(0)
     };
-
-    let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
 
     // Convert Box to Arc for sharing with SharedBuildAccumulator
     let join_hash_map = Arc::new(join_hash_map);
