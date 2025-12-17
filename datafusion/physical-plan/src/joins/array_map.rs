@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow::buffer::MutableBuffer;
 use num_traits::AsPrimitive;
 use std::fmt;
 use std::sync::Arc;
@@ -317,6 +318,53 @@ impl ArrayMap {
             }
             Ok(None)
         }
+    }
+
+    pub fn mark_existing_probes(
+        &self,
+        probe_side_keys: &[ArrayRef],
+        buf: &mut MutableBuffer,
+    ) -> Result<()> {
+        if probe_side_keys.len() != 1 {
+            return internal_err!(
+                "ArrayMap join expects 1 join key, but got {}",
+                probe_side_keys.len()
+            );
+        }
+        let array = &probe_side_keys[0];
+
+        macro_rules! fill_buffer {
+            ($T:ty) => {{
+                let arr = array.as_primitive::<$T>();
+                for (i, val) in arr.iter().enumerate() {
+                    if let Some(val) = val {
+                        let key: u64 = val.as_();
+                        let idx = (key.wrapping_sub(self.offset())) as usize;
+                        if idx < self.data().len() && self.data()[idx] != 0 {
+                            arrow::util::bit_util::set_bit(buf.as_slice_mut(), i);
+                        }
+                    }
+                }
+            }};
+        }
+
+        match array.data_type() {
+            DataType::Int8 => fill_buffer!(Int8Type),
+            DataType::Int16 => fill_buffer!(Int16Type),
+            DataType::Int32 => fill_buffer!(Int32Type),
+            DataType::Int64 => fill_buffer!(Int64Type),
+            DataType::UInt8 => fill_buffer!(UInt8Type),
+            DataType::UInt16 => fill_buffer!(UInt16Type),
+            DataType::UInt32 => fill_buffer!(UInt32Type),
+            DataType::UInt64 => fill_buffer!(UInt64Type),
+            _ => {
+                return internal_err!(
+                    "Unsupported type for ArrayMap lookup: {:?}",
+                    array.data_type()
+                );
+            }
+        }
+        Ok(())
     }
 }
 

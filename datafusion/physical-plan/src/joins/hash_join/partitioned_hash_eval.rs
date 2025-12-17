@@ -21,12 +21,9 @@ use std::{any::Any, fmt::Display, hash::Hash, sync::Arc};
 
 use ahash::RandomState;
 use arrow::{
-    array::{AsArray, BooleanArray, UInt64Array},
+    array::{BooleanArray, UInt64Array},
     buffer::MutableBuffer,
-    datatypes::{
-        DataType, Int8Type, Int16Type, Int32Type, Int64Type, Schema, UInt8Type,
-        UInt16Type, UInt32Type, UInt64Type,
-    },
+    datatypes::{DataType, Schema},
     util::bit_util,
 };
 use datafusion_common::{Result, internal_datafusion_err, internal_err};
@@ -301,46 +298,9 @@ impl PhysicalExpr for HashTableLookupExpr {
                 }
             }
             Map::ArrayMap(array_map) => {
-                // TODO: to ArrayKV strcut and adding method
-                if self.right_expr.len() != 1 {
-                    return Err(internal_datafusion_err!(
-                        "should 1 right column when using arrayKV"
-                    ));
-                }
-                let right = evaluate_expressions_to_arrays(&self.right_expr, batch)?;
-
-                let mut right_side = vec![0u64; right[0].len()];
-
-                macro_rules! fill_buffer {
-                    ($ARR_TYPE:ty) => {{
-                        let arr = right[0].as_primitive::<$ARR_TYPE>();
-                        for (i, val) in arr.values().iter().enumerate() {
-                            right_side[i] = *val as u64;
-                        }
-                    }};
-                }
-
-                match right[0].data_type() {
-                    DataType::Int8 => fill_buffer!(Int8Type),
-                    DataType::Int16 => fill_buffer!(Int16Type),
-                    DataType::Int32 => fill_buffer!(Int32Type),
-                    DataType::Int64 => fill_buffer!(Int64Type),
-                    DataType::UInt8 => fill_buffer!(UInt8Type),
-                    DataType::UInt16 => fill_buffer!(UInt16Type),
-                    DataType::UInt32 => fill_buffer!(UInt32Type),
-                    DataType::UInt64 => fill_buffer!(UInt64Type),
-                    _ => internal_err!(
-                        "Unsupported data type for ArrayMap {:?}",
-                        right[0].data_type()
-                    )?,
-                }
-
-                for (i, v) in right_side.iter().enumerate() {
-                    let idx = (v.wrapping_sub(array_map.offset())) as usize;
-                    if idx < array_map.data().len() && array_map.data()[idx] != 0 {
-                        bit_util::set_bit(buf.as_slice_mut(), i);
-                    }
-                }
+                let right =
+                    evaluate_expressions_to_arrays(&self.right_expr, batch)?;
+                array_map.mark_existing_probes(&right, &mut buf)?;
             }
         }
 
