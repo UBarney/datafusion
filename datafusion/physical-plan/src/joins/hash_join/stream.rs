@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use crate::joins::PartitionMode;
-use crate::joins::array_kv::Map;
+use crate::joins::array_map::Map;
 use crate::joins::hash_join::exec::JoinLeftData;
 use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
@@ -597,10 +597,7 @@ impl HashJoinStream {
         let timer = self.join_metrics.join_time.timer();
 
         // if the left side is empty, we can skip the (potentially expensive) join operation
-        let is_empty = match build_side.left_data.map() {
-            Map::HashMap(map) => map.is_empty(),
-            Map::ArrayKV(array_kv) => array_kv.data().is_empty(),
-        };
+        let is_empty = build_side.left_data.map().is_empty();
 
         if is_empty && self.filter.is_none() {
             let result = build_batch_empty_build_side(
@@ -631,8 +628,8 @@ impl HashJoinStream {
                 &mut self.probe_indices_buffer,
                 &mut self.build_indices_buffer,
             )?,
-            Map::ArrayKV(array_kv) => {
-                let next_offset = array_kv.get_matched_indices_with_limit_offset(
+            Map::ArrayMap(array_map) => {
+                let next_offset = array_map.get_matched_indices_with_limit_offset(
                     &state.values,
                     self.batch_size,
                     state.offset,

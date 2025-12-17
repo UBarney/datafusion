@@ -39,7 +39,7 @@ pub mod chain;
 
 mod join_filter;
 mod join_hash_map;
-mod array_kv;
+mod array_map;
 
 #[cfg(test)]
 pub mod test_utils;

@@ -27,7 +27,7 @@ use crate::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation,
 };
-use crate::joins::array_kv::{ArrayKV, Map};
+use crate::joins::array_map::{ArrayMap, Map};
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::shared_bounds::{
     ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
@@ -93,9 +93,9 @@ use parking_lot::Mutex;
 pub(crate) const HASH_JOIN_SEED: RandomState =
     RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
 
-const ARRAY_KV_CREATED_COUNT_METRIC_NAME: &'static str = "array_kv_created_count";
+const array_map_CREATED_COUNT_METRIC_NAME: &'static str = "array_map_created_count";
 
-fn try_create_array_kv(
+fn try_create_array_map(
     bounds: &Option<PartitionBounds>,
     schema: &SchemaRef,
     batches: &[RecordBatch],
@@ -105,7 +105,7 @@ fn try_create_array_kv(
     perfect_hash_join_small_build_threshold: usize,
     perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
-) -> Result<Option<(ArrayKV, RecordBatch, Vec<ArrayRef>)>> {
+) -> Result<Option<(ArrayMap, RecordBatch, Vec<ArrayRef>)>> {
     if on_left.len() != 1 {
         return Ok(None);
     }
@@ -175,7 +175,7 @@ fn try_create_array_kv(
 
     let offset_val = min_val as u64;
 
-    // todo: move compute mem usage to ArrayKV
+    // todo: move compute mem usage to ArrayMap
     let size = (range + 1) as usize;
     let mem_size = size * size_of::<u64>();
 
@@ -184,10 +184,10 @@ fn try_create_array_kv(
     let batch = concat_batches(&schema, batches)?;
     let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
-    let array_kv = ArrayKV::try_new(&left_values[0], offset_val, size)?;
+    let array_map = ArrayMap::try_new(&left_values[0], offset_val, size)?;
 
-    match array_kv {
-        Some(array_kv) => {
+    match array_map {
+        Some(array_map) => {
             // TODO: move to caller
             metrics.build_mem_used.add(mem_size);
             {
@@ -196,16 +196,16 @@ fn try_create_array_kv(
 
                 let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![10]));
 
-                let r = array_kv.get_matched_indices_with_limit_offset(
+                let r = array_map.get_matched_indices_with_limit_offset(
                     &[probe_array],
                     1000,
                     (0, None),
                     &mut probe_indices,
                     &mut build_indices,
                 );
-                // dbg!(build_indices, &left_values[0], offset_val, range, &array_kv);
+                // dbg!(build_indices, &left_values[0], offset_val, range, &array_map);
             }
-            Ok(Some((array_kv, batch, left_values)))
+            Ok(Some((array_map, batch, left_values)))
         }
         None => {
             reservation.shrink(mem_size);
@@ -1048,8 +1048,8 @@ impl ExecutionPlan for HashJoinExec {
 
         let join_metrics = BuildProbeJoinMetrics::new(partition, &self.metrics);
 
-        let array_kv_created_count = MetricBuilder::new(&self.metrics)
-            .counter(ARRAY_KV_CREATED_COUNT_METRIC_NAME, partition);
+        let array_map_created_count = MetricBuilder::new(&self.metrics)
+            .counter(array_map_CREATED_COUNT_METRIC_NAME, partition);
 
         let perfect_hash_join_small_build_threshold = context
             .session_config()
@@ -1090,7 +1090,7 @@ impl ExecutionPlan for HashJoinExec {
                     perfect_hash_join_small_build_threshold,
                     perfect_hash_join_min_key_density,
                     self.null_equality,
-                    array_kv_created_count,
+                    array_map_created_count,
                 ))
             })?,
             PartitionMode::Partitioned => {
@@ -1122,7 +1122,7 @@ impl ExecutionPlan for HashJoinExec {
                     perfect_hash_join_small_build_threshold,
                     perfect_hash_join_min_key_density,
                     self.null_equality,
-                    array_kv_created_count,
+                    array_map_created_count,
                 ))
             }
             PartitionMode::Auto => {
@@ -1555,7 +1555,7 @@ async fn collect_left_input(
     perfect_hash_join_small_build_threshold: usize,
     perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
-    array_kv_created_count: Count,
+    array_map_created_count: Count,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
@@ -1620,8 +1620,8 @@ async fn collect_left_input(
         _ => None,
     };
 
-    let (join_hash_map, batch, left_values) = if let Some((array_kv, batch, left_value)) =
-        try_create_array_kv(
+    let (join_hash_map, batch, left_values) = if let Some((array_map, batch, left_value)) =
+        try_create_array_map(
             &bounds,
             &schema,
             &batches,
@@ -1632,8 +1632,8 @@ async fn collect_left_input(
             perfect_hash_join_min_key_density,
             null_equality,
         )? {
-        array_kv_created_count.add(1);
-        (Map::ArrayKV(array_kv), batch, left_value)
+        array_map_created_count.add(1);
+        (Map::ArrayMap(array_map), batch, left_value)
     } else {
         // Estimation of memory size, required for hashtable, prior to allocation.
         // Final result can be verified using `RawTable.allocation_info()`
@@ -2081,8 +2081,8 @@ mod tests {
         if use_perfect_hash_join_as_possible {
             assert!(
                 metrics
-                    .sum_by_name(ARRAY_KV_CREATED_COUNT_METRIC_NAME)
-                    .expect("should have ARRAY_KV_CREATED_COUNT_METRIC_NAME metrics")
+                    .sum_by_name(array_map_CREATED_COUNT_METRIC_NAME)
+                    .expect("should have array_map_CREATED_COUNT_METRIC_NAME metrics")
                     .as_usize()
                     >= 1
             );
@@ -2597,7 +2597,7 @@ mod tests {
         if use_perfect_hash_join_as_possible {
             assert!(
                 metrics
-                    .sum_by_name(ARRAY_KV_CREATED_COUNT_METRIC_NAME)
+                    .sum_by_name(array_map_CREATED_COUNT_METRIC_NAME)
                     .expect("should have metrics")
                     .as_usize()
                     >= 1

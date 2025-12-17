@@ -49,13 +49,13 @@ use datafusion_common::{Result, internal_err};
 /// This structure **cannot** be used for joins with `NullEquality::NullEqualsNull` if the
 /// build side contains `NULL`s, as it does not have a mechanism to store and match `NULL` values.
 #[derive(Debug)]
-pub struct ArrayKV {
+pub struct ArrayMap {
     data: Vec<u32>,
     offset: u64,
     next: Option<Vec<u32>>,
 }
 
-impl ArrayKV {
+impl ArrayMap {
     pub fn data(&self) -> &[u32] {
         &self.data
     }
@@ -322,17 +322,17 @@ impl ArrayKV {
 
 pub enum Map {
     HashMap(Arc<dyn JoinHashMapType>),
-    ArrayKV(ArrayKV),
+    ArrayMap(ArrayMap),
 }
 
 impl fmt::Debug for Map {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Map::HashMap(_) => write!(f, "JoinHashMap::HashMap(...)"),
-            Map::ArrayKV(array_kv) => f
+            Map::ArrayMap(array_map) => f
                 .debug_struct("JoinHashMap::ArrayKV")
-                .field("data_len", &array_kv.data.len())
-                .field("offset", &array_kv.offset)
+                .field("data_len", &array_map.data.len())
+                .field("offset", &array_map.offset)
                 .finish(),
         }
     }
@@ -343,7 +343,7 @@ impl Map {
     pub fn len(&self) -> usize {
         match self {
             Map::HashMap(map) => map.len(),
-            Map::ArrayKV(array_kv) => array_kv.data.len(),
+            Map::ArrayMap(array_map) => array_map.data.len(),
         }
     }
 
@@ -360,7 +360,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_array_kv_duplicate_elements() -> Result<()> {
+    fn test_array_map_duplicate_elements() -> Result<()> {
         // Build side: values and their 0-based indices
         // Key 5: idx 0, 3, 6
         // Key 10: idx 1, 4
@@ -370,8 +370,8 @@ mod tests {
         let offset_val = 0;
         let size = 20; // Max key is 15, so a size of 20 is sufficient
 
-        let array_kv = ArrayKV::try_new(&build_array, offset_val, size)?
-            .expect("should create ArrayKV");
+        let array_map = ArrayMap::try_new(&build_array, offset_val, size)?
+            .expect("should create ArrayMap");
 
         // Verify the internal state for next chain (FIFO order)
         // Construction iterates backwards: 6, 5, 4, 3, 2, 1, 0
@@ -385,11 +385,11 @@ mod tests {
         // next[3] -> 7 (idx 6)
         // next[6] -> 0 (end)
 
-        assert_eq!(array_kv.data[5], 1); // key 5 -> first index 0
-        assert_eq!(array_kv.data[10], 2); // key 10 -> first index 1
-        assert_eq!(array_kv.data[15], 3); // key 15 -> first index 2
+        assert_eq!(array_map.data[5], 1); // key 5 -> first index 0
+        assert_eq!(array_map.data[10], 2); // key 10 -> first index 1
+        assert_eq!(array_map.data[15], 3); // key 15 -> first index 2
 
-        let next_chain = array_kv.next.as_ref().expect("next chain should exist");
+        let next_chain = array_map.next.as_ref().expect("next chain should exist");
         assert_eq!(next_chain[0], 4); // idx 0 -> next 3
         assert_eq!(next_chain[3], 7); // idx 3 -> next 6
         assert_eq!(next_chain[6], 0); // idx 6 -> end
@@ -409,7 +409,7 @@ mod tests {
         let batch_size = 100; // Large batch size to get all results at once
         let initial_offset = (0, None);
 
-        let result_offset = array_kv.get_matched_indices_with_limit_offset(
+        let result_offset = array_map.get_matched_indices_with_limit_offset(
             &prob_side_keys,
             batch_size,
             initial_offset,
@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_kv_limit_offset_duplicate_elements() -> Result<()> {
+    fn test_array_map_limit_offset_duplicate_elements() -> Result<()> {
         // Key 5: idx 0, 3, 6
         // Key 10: idx 1, 4
         // Key 15: idx 2, 5
@@ -449,8 +449,8 @@ mod tests {
         let offset_val = 5;
         let range = 11;
 
-        let array_kv = ArrayKV::try_new(&build_array, offset_val, range)?
-            .expect("should create ArrayKV");
+        let array_map = ArrayMap::try_new(&build_array, offset_val, range)?
+            .expect("should create ArrayMap");
 
         let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![5, 10, 15, 7, 8, 9]));
         let prob_side_keys = [probe_array.clone()];
@@ -461,7 +461,7 @@ mod tests {
         let batch_size = 2;
 
         // First call: Should get 2 matches for probe key 5
-        let result_offset = array_kv.get_matched_indices_with_limit_offset(
+        let result_offset = array_map.get_matched_indices_with_limit_offset(
             &prob_side_keys,
             batch_size,
             current_offset,
@@ -480,7 +480,7 @@ mod tests {
         // Second call: Should get the last match for probe key 5, then one match for key 10
         current_offset = result_offset.unwrap();
 
-        let result_offset = array_kv.get_matched_indices_with_limit_offset(
+        let result_offset = array_map.get_matched_indices_with_limit_offset(
             &prob_side_keys,
             batch_size,
             current_offset,
@@ -499,7 +499,7 @@ mod tests {
         // Third call: Should get last match for key 10, then one match for key 15
         current_offset = result_offset.unwrap();
 
-        let result_offset = array_kv.get_matched_indices_with_limit_offset(
+        let result_offset = array_map.get_matched_indices_with_limit_offset(
             &prob_side_keys,
             batch_size,
             current_offset,
@@ -518,7 +518,7 @@ mod tests {
         // Fourth call: Should get last match for key 15
         current_offset = result_offset.unwrap();
 
-        let result_offset = array_kv.get_matched_indices_with_limit_offset(
+        let result_offset = array_map.get_matched_indices_with_limit_offset(
             &prob_side_keys,
             batch_size,
             current_offset,
@@ -533,7 +533,7 @@ mod tests {
         assert_eq!(Some((3, Some(0))), result_offset);
 
         current_offset = result_offset.unwrap();
-        let result_offset = array_kv.get_matched_indices_with_limit_offset(
+        let result_offset = array_map.get_matched_indices_with_limit_offset(
             &prob_side_keys,
             batch_size,
             current_offset,
@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_kv_with_limit_from_user() -> Result<()> {
+    fn test_array_map_with_limit_from_user() -> Result<()> {
         // buildSide: `[1, 3, 5, 7, 8, 8, 10]`
         // probSide: `[8, 10, 6, 2, 10, 4]`
         // limit: 2
@@ -560,8 +560,8 @@ mod tests {
         // min value is 1, max is 10.
         let offset_val = 1;
         let range = 10;
-        let array_kv = ArrayKV::try_new(&build_array, offset_val, range)?
-            .expect("should create ArrayKV");
+        let array_map = ArrayMap::try_new(&build_array, offset_val, range)?
+            .expect("should create ArrayMap");
 
         let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![8, 10, 6, 2, 10, 4]));
         let prob_side_keys = [probe_array.clone()];
@@ -580,7 +580,7 @@ mod tests {
 
         // Loop until all matches are found
         while let Some(offset) = current_offset {
-            let result_offset = array_kv.get_matched_indices_with_limit_offset(
+            let result_offset = array_map.get_matched_indices_with_limit_offset(
                 &prob_side_keys,
                 batch_size,
                 offset,

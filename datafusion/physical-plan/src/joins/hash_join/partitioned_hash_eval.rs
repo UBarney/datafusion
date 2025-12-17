@@ -36,7 +36,7 @@ use datafusion_physical_expr_common::{
     utils::evaluate_expressions_to_arrays,
 };
 
-use crate::{hash_utils::create_hashes, joins::array_kv::Map};
+use crate::{hash_utils::create_hashes, joins::array_map::Map};
 
 /// Physical expression that computes hash values for a set of columns
 ///
@@ -300,7 +300,7 @@ impl PhysicalExpr for HashTableLookupExpr {
                     }
                 }
             }
-            Map::ArrayKV(array_kv) => {
+            Map::ArrayMap(array_map) => {
                 // TODO: to ArrayKV strcut and adding method
                 if self.right_expr.len() != 1 {
                     return Err(internal_datafusion_err!(
@@ -330,14 +330,14 @@ impl PhysicalExpr for HashTableLookupExpr {
                     DataType::UInt32 => fill_buffer!(UInt32Type),
                     DataType::UInt64 => fill_buffer!(UInt64Type),
                     _ => internal_err!(
-                        "Unsupported data type for ArrayKV {:?}",
+                        "Unsupported data type for ArrayMap {:?}",
                         right[0].data_type()
                     )?,
                 }
 
                 for (i, v) in right_side.iter().enumerate() {
-                    let idx = (v.wrapping_sub(array_kv.offset())) as usize;
-                    if idx < array_kv.data().len() && array_kv.data()[idx] != 0 {
+                    let idx = (v.wrapping_sub(array_map.offset())) as usize;
+                    if idx < array_map.data().len() && array_map.data()[idx] != 0 {
                         bit_util::set_bit(buf.as_slice_mut(), i);
                     }
                 }
