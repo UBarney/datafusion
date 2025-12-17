@@ -468,14 +468,18 @@ config_namespace! {
         /// metadata memory consumption
         pub batch_size: usize, default = 8192
 
-        /// Maximum array size for perfect hash join.
-        pub perfect_hash_join_max_array_size: usize, default = 1024
+        /// A perfect hash join will be considered if the number of rows on the build
+        /// side is below this threshold. This provides a fast path for joins with
+        /// very small build sides, bypassing the density check.
+        pub perfect_hash_join_small_build_threshold: usize, default = 1024
 
-        /// The dense ratio threshold for perfect hash join.
-        ///
-        /// If the ratio of the number of rows to the range of join keys is greater
-        /// than this value, DataFusion will use a perfect hash join.
-        pub perfect_hash_join_dense_ratio_threshold: f64, default = 0.99
+        /// The minimum required density of join keys on the build side to consider a
+        /// perfect hash join. Density is calculated as:
+        /// `(number of rows) / (max_key - min_key + 1)`.
+        /// A perfect hash join may be used if the actual key density exceeds this
+        /// value. For example, a value of 0.99 means the keys must fill at least
+        /// 99% of their value range.
+        pub perfect_hash_join_min_key_density: f64, default = 0.99
 
         /// When set to true, record batches will be examined between each operator and
         /// small batches will be coalesced into larger batches. This is helpful when there

@@ -102,8 +102,8 @@ fn try_create_array_kv(
     on_left: &[PhysicalExprRef],
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
-    max_array_size: usize,
-    dense_ratio_threshold: f64,
+    perfect_hash_join_small_build_threshold: usize,
+    perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
 ) -> Result<Option<(ArrayKV, RecordBatch, Vec<ArrayRef>)>> {
     if on_left.len() != 1 {
@@ -158,7 +158,7 @@ fn try_create_array_kv(
 
     let range = max_val - min_val;
     let num_row: usize = batches.iter().map(|x| x.num_rows()).sum();
-    let dense_ratio = (num_row as f64) / (range as f64);
+    let dense_ratio = (num_row as f64) / ((range + 1) as f64);
     // if dense_ratio > dense_ratio_threshold {
     //     debug!(
     //         "dense! ratio: {}, range: {}, len: {}",
@@ -166,7 +166,9 @@ fn try_create_array_kv(
     //     );
     // }
 
-    if range > max_array_size as i128 && dense_ratio < dense_ratio_threshold {
+    if range > perfect_hash_join_small_build_threshold as i128
+        && dense_ratio < perfect_hash_join_min_key_density
+    {
         // dbg!(range, num_row);
         return Ok(None);
     }
@@ -1049,16 +1051,16 @@ impl ExecutionPlan for HashJoinExec {
         let array_kv_created_count = MetricBuilder::new(&self.metrics)
             .counter(ARRAY_KV_CREATED_COUNT_METRIC_NAME, partition);
 
-        let perfect_hash_join_max_array_size = context
+        let perfect_hash_join_small_build_threshold = context
             .session_config()
             .options()
             .execution
-            .perfect_hash_join_max_array_size;
-        let perfect_hash_join_dense_ratio_threshold = context
+            .perfect_hash_join_small_build_threshold;
+        let perfect_hash_join_min_key_density = context
             .session_config()
             .options()
             .execution
-            .perfect_hash_join_dense_ratio_threshold;
+            .perfect_hash_join_min_key_density;
         let left_fut = match self.mode {
             PartitionMode::CollectLeft => self.left_fut.try_once(|| {
                 let left_stream = self.left.execute(0, Arc::clone(&context))?;
@@ -1085,8 +1087,8 @@ impl ExecutionPlan for HashJoinExec {
                         .options()
                         .optimizer
                         .hash_join_inlist_pushdown_max_distinct_values,
-                    perfect_hash_join_max_array_size,
-                    perfect_hash_join_dense_ratio_threshold,
+                    perfect_hash_join_small_build_threshold,
+                    perfect_hash_join_min_key_density,
                     self.null_equality,
                     array_kv_created_count,
                 ))
@@ -1117,8 +1119,8 @@ impl ExecutionPlan for HashJoinExec {
                         .options()
                         .optimizer
                         .hash_join_inlist_pushdown_max_distinct_values,
-                    perfect_hash_join_max_array_size,
-                    perfect_hash_join_dense_ratio_threshold,
+                    perfect_hash_join_small_build_threshold,
+                    perfect_hash_join_min_key_density,
                     self.null_equality,
                     array_kv_created_count,
                 ))
@@ -1489,9 +1491,8 @@ impl BuildSideState {
 fn should_collect_min_max_for_perfect_hash(
     on_left: &[PhysicalExprRef],
     schema: &SchemaRef,
-    use_perfect_hash_join_as_possible: usize,
 ) -> Result<bool> {
-    if on_left.len() != 1 || use_perfect_hash_join_as_possible == 0 {
+    if on_left.len() != 1 {
         return Ok(false);
     }
 
@@ -1551,18 +1552,15 @@ async fn collect_left_input(
     should_compute_dynamic_filters: bool,
     max_inlist_size: usize,
     max_inlist_distinct_values: usize,
-    use_perfect_hash_join_as_possible: usize,
-    dense_ratio_threshold: f64,
+    perfect_hash_join_small_build_threshold: usize,
+    perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
     array_kv_created_count: Count,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
-    let should_collect_for_perfect_hash = should_collect_min_max_for_perfect_hash(
-        &on_left,
-        &schema,
-        use_perfect_hash_join_as_possible,
-    )?;
+    let should_collect_for_perfect_hash =
+        should_collect_min_max_for_perfect_hash(&on_left, &schema)?;
     // This operation performs 2 steps at once:
     // 1. creates a [JoinHashMap] of all batches from the stream
     // 2. stores the batches in a vector.
@@ -1630,8 +1628,8 @@ async fn collect_left_input(
             &on_left,
             &mut reservation,
             &metrics,
-            use_perfect_hash_join_as_possible,
-            dense_ratio_threshold,
+            perfect_hash_join_small_build_threshold,
+            perfect_hash_join_min_key_density,
             null_equality,
         )? {
         array_kv_created_count.add(1);
@@ -1797,20 +1795,20 @@ mod tests {
             session_config
                 .options_mut()
                 .execution
-                .perfect_hash_join_max_array_size = 819200;
+                .perfect_hash_join_small_build_threshold = 819200;
             session_config
                 .options_mut()
                 .execution
-                .perfect_hash_join_dense_ratio_threshold = 0.0;
+                .perfect_hash_join_min_key_density = 0.0;
         } else {
             session_config
                 .options_mut()
                 .execution
-                .perfect_hash_join_max_array_size = 0;
+                .perfect_hash_join_small_build_threshold = 0;
             session_config
                 .options_mut()
                 .execution
-                .perfect_hash_join_dense_ratio_threshold = 1.0 / 0.0;
+                .perfect_hash_join_min_key_density = 1.0 / 0.0;
         }
         Arc::new(TaskContext::default().with_session_config(session_config))
     }
