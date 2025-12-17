@@ -45,6 +45,7 @@ use crate::{
 };
 
 use arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
+use arrow::buffer::Buffer;
 use arrow::compute::BatchCoalescer;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -639,8 +640,8 @@ impl HashJoinStream {
                     &mut self.build_indices_buffer,
                 )?;
                 (
-                    std::mem::take(&mut self.build_indices_buffer).into(),
-                    std::mem::take(&mut self.probe_indices_buffer).into(),
+                    UInt64Array::from(self.build_indices_buffer.clone()),
+                    UInt32Array::from(self.probe_indices_buffer.clone()),
                     next_offset,
                 )
             }

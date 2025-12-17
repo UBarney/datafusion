@@ -229,11 +229,16 @@ impl ArrayKV {
         let arr = array.as_primitive::<T>();
 
         // arr.values().get_unchecked(index)
+        let have_null = arr.null_count() > 0;
 
         if self.next.is_none() {
-            let end = (current_offset.0 + limit).min(arr.len());
-            for prob_idx in current_offset.0..end {
-                if arr.is_null(prob_idx) {
+            for prob_idx in current_offset.0..arr.len() {
+                if build_indices.len() == limit {
+                    return Ok(Some((prob_idx, None)));
+                }
+
+                // short circuit
+                if have_null && arr.is_null(prob_idx) {
                     continue;
                 }
                 // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
@@ -248,11 +253,7 @@ impl ArrayKV {
                 build_indices.push((self.data()[idx_in_build_side] - 1) as u64);
                 probe_indices.push(prob_idx as u32);
             }
-            if end == array.len() {
-                Ok(None)
-            } else {
-                Ok(Some((end, None)))
-            }
+            return Ok(None);
         } else {
             let mut remaining_output = limit;
             let to_skip = match current_offset {

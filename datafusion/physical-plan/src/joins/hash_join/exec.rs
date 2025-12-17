@@ -159,14 +159,15 @@ fn try_create_array_kv(
     let range = max_val - min_val;
     let num_row: usize = batches.iter().map(|x| x.num_rows()).sum();
     let dense_ratio = (num_row as f64) / (range as f64);
-    if dense_ratio > dense_ratio_threshold {
-        debug!(
-            "dense! ratio: {}, range: {}, len: {}",
-            dense_ratio, range, num_row
-        );
-    }
+    // if dense_ratio > dense_ratio_threshold {
+    //     debug!(
+    //         "dense! ratio: {}, range: {}, len: {}",
+    //         dense_ratio, range, num_row
+    //     );
+    // }
 
-    if range > max_array_size as i128 && dense_ratio < 0.9 {
+    if range > max_array_size as i128 && dense_ratio < dense_ratio_threshold {
+        // dbg!(range, num_row);
         return Ok(None);
     }
 
