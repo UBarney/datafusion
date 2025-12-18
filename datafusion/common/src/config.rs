@@ -471,6 +471,9 @@ config_namespace! {
         /// A perfect hash join will be considered if the number of rows on the build
         /// side is below this threshold. This provides a fast path for joins with
         /// very small build sides, bypassing the density check.
+        /// 
+        /// TODO: Currently only supports cases where left_side.num_rows() < u32::MAX.
+        /// Support for left_side.num_rows() >= u32::MAX will be added in the future.
         pub perfect_hash_join_small_build_threshold: usize, default = 1024
 
         /// The minimum required density of join keys on the build side to consider a
@@ -479,6 +482,9 @@ config_namespace! {
         /// A perfect hash join may be used if the actual key density exceeds this
         /// value. For example, a value of 0.99 means the keys must fill at least
         /// 99% of their value range.
+        /// 
+        /// TODO: Currently only supports cases where left_side.num_rows() < u32::MAX.
+        /// Support for left_side.num_rows() >= u32::MAX will be added in the future.
         pub perfect_hash_join_min_key_density: f64, default = 0.99
 
         /// When set to true, record batches will be examined between each operator and

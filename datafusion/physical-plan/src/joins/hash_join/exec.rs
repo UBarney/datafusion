@@ -93,7 +93,7 @@ use parking_lot::Mutex;
 pub(crate) const HASH_JOIN_SEED: RandomState =
     RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
 
-const array_map_CREATED_COUNT_METRIC_NAME: &'static str = "array_map_created_count";
+const ARRAY_MAP_CREATED_COUNT_METRIC_NAME: &'static str = "array_map_created_count";
 
 fn try_create_array_map(
     bounds: &Option<PartitionBounds>,
@@ -166,6 +166,11 @@ fn try_create_array_map(
     //     );
     // }
 
+    // TODO: support create ArrayMap<u64>
+    if num_row >= u32::MAX as usize {
+        return Ok(None);
+    }
+
     if range > perfect_hash_join_small_build_threshold as i128
         && dense_ratio < perfect_hash_join_min_key_density
     {
@@ -177,7 +182,7 @@ fn try_create_array_map(
 
     // todo: move compute mem usage to ArrayMap
     let size = (range + 1) as usize;
-    let mem_size = size * size_of::<u64>();
+    let mem_size = size * size_of::<u32>();
 
     reservation.try_grow(mem_size)?;
 
@@ -190,21 +195,6 @@ fn try_create_array_map(
         Some(array_map) => {
             // TODO: move to caller
             metrics.build_mem_used.add(mem_size);
-            {
-                let mut probe_indices = Vec::with_capacity(1000);
-                let mut build_indices = Vec::with_capacity(1000);
-
-                let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![10]));
-
-                let r = array_map.get_matched_indices_with_limit_offset(
-                    &[probe_array],
-                    1000,
-                    (0, None),
-                    &mut probe_indices,
-                    &mut build_indices,
-                );
-                // dbg!(build_indices, &left_values[0], offset_val, range, &array_map);
-            }
             Ok(Some((array_map, batch, left_values)))
         }
         None => {
@@ -1049,7 +1039,7 @@ impl ExecutionPlan for HashJoinExec {
         let join_metrics = BuildProbeJoinMetrics::new(partition, &self.metrics);
 
         let array_map_created_count = MetricBuilder::new(&self.metrics)
-            .counter(array_map_CREATED_COUNT_METRIC_NAME, partition);
+            .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, partition);
 
         let perfect_hash_join_small_build_threshold = context
             .session_config()
@@ -1620,8 +1610,8 @@ async fn collect_left_input(
         _ => None,
     };
 
-    let (join_hash_map, batch, left_values) = if let Some((array_map, batch, left_value)) =
-        try_create_array_map(
+    let (join_hash_map, batch, left_values) =
+        if let Some((array_map, batch, left_value)) = try_create_array_map(
             &bounds,
             &schema,
             &batches,
@@ -1632,57 +1622,57 @@ async fn collect_left_input(
             perfect_hash_join_min_key_density,
             null_equality,
         )? {
-        array_map_created_count.add(1);
-        (Map::ArrayMap(array_map), batch, left_value)
-    } else {
-        // Estimation of memory size, required for hashtable, prior to allocation.
-        // Final result can be verified using `RawTable.allocation_info()`
-        let fixed_size_u32 = size_of::<JoinHashMapU32>();
-        let fixed_size_u64 = size_of::<JoinHashMapU64>();
-
-        // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
-        // `u64` indice variant
-        // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-        let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
-            let estimated_hashtable_size =
-                estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-            reservation.try_grow(estimated_hashtable_size)?;
-            metrics.build_mem_used.add(estimated_hashtable_size);
-            Box::new(JoinHashMapU64::with_capacity(num_rows))
+            array_map_created_count.add(1);
+            (Map::ArrayMap(array_map), batch, left_value)
         } else {
-            let estimated_hashtable_size =
-                estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-            reservation.try_grow(estimated_hashtable_size)?;
-            metrics.build_mem_used.add(estimated_hashtable_size);
-            Box::new(JoinHashMapU32::with_capacity(num_rows))
+            // Estimation of memory size, required for hashtable, prior to allocation.
+            // Final result can be verified using `RawTable.allocation_info()`
+            let fixed_size_u32 = size_of::<JoinHashMapU32>();
+            let fixed_size_u64 = size_of::<JoinHashMapU64>();
+
+            // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
+            // `u64` indice variant
+            // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
+            let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+                reservation.try_grow(estimated_hashtable_size)?;
+                metrics.build_mem_used.add(estimated_hashtable_size);
+                Box::new(JoinHashMapU64::with_capacity(num_rows))
+            } else {
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+                reservation.try_grow(estimated_hashtable_size)?;
+                metrics.build_mem_used.add(estimated_hashtable_size);
+                Box::new(JoinHashMapU32::with_capacity(num_rows))
+            };
+
+            let mut hashes_buffer = Vec::new();
+            let mut offset = 0;
+
+            // Updating hashmap starting from the last batch
+            for batch in batches_iter.clone() {
+                hashes_buffer.clear();
+                hashes_buffer.resize(batch.num_rows(), 0);
+                update_hash(
+                    &on_left,
+                    batch,
+                    &mut *hashmap,
+                    offset,
+                    &random_state,
+                    &mut hashes_buffer,
+                    0,
+                    true,
+                )?;
+                offset += batch.num_rows();
+            }
+
+            let batch = concat_batches(&schema, batches_iter.clone())?;
+
+            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+
+            (Map::HashMap(hashmap.into()), batch, left_values)
         };
-
-        let mut hashes_buffer = Vec::new();
-        let mut offset = 0;
-
-        // Updating hashmap starting from the last batch
-        for batch in batches_iter.clone() {
-            hashes_buffer.clear();
-            hashes_buffer.resize(batch.num_rows(), 0);
-            update_hash(
-                &on_left,
-                batch,
-                &mut *hashmap,
-                offset,
-                &random_state,
-                &mut hashes_buffer,
-                0,
-                true,
-            )?;
-            offset += batch.num_rows();
-        }
-
-        let batch = concat_batches(&schema, batches_iter.clone())?;
-
-        let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
-
-        (Map::HashMap(hashmap.into()), batch, left_values)
-    };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
@@ -2081,7 +2071,7 @@ mod tests {
         if use_perfect_hash_join_as_possible {
             assert!(
                 metrics
-                    .sum_by_name(array_map_CREATED_COUNT_METRIC_NAME)
+                    .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
                     .expect("should have array_map_CREATED_COUNT_METRIC_NAME metrics")
                     .as_usize()
                     >= 1
@@ -2597,7 +2587,7 @@ mod tests {
         if use_perfect_hash_join_as_possible {
             assert!(
                 metrics
-                    .sum_by_name(array_map_CREATED_COUNT_METRIC_NAME)
+                    .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
                     .expect("should have metrics")
                     .as_usize()
                     >= 1
