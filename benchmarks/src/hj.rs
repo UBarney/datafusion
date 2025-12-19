@@ -20,6 +20,7 @@ use datafusion::physical_plan::execute_stream;
 use datafusion::{error::Result, prelude::SessionContext};
 use datafusion_common::instant::Instant;
 use datafusion_common::{exec_datafusion_err, exec_err, DataFusionError};
+use std::path::PathBuf;
 use structopt::StructOpt;
 
 use futures::StreamExt;
@@ -35,7 +36,7 @@ use futures::StreamExt;
 #[derive(Debug, StructOpt, Clone)]
 #[structopt(verbatim_doc_comment)]
 pub struct RunOpt {
-    /// Query number (between 1 and 12). If not specified, runs all queries
+    /// Query number (between 1 and 6). If not specified, runs all queries
     #[structopt(short, long)]
     query: Option<usize>,
 
@@ -43,128 +44,61 @@ pub struct RunOpt {
     #[structopt(flatten)]
     common: CommonOpt,
 
+    /// Path to TPC-H data (required for TPC-H queries)
+    #[structopt(parse(from_os_str), short = "p", long = "path")]
+    path: Option<PathBuf>,
+
     /// If present, write results json here
     #[structopt(parse(from_os_str), short = "o", long = "output")]
-    output_path: Option<std::path::PathBuf>,
+    output_path: Option<PathBuf>,
 }
 
 /// Inline SQL queries for Hash Join benchmarks
-///
-/// Each query's comment includes:
-///   - Left row count × Right row count
-///   - Join predicate selectivity (approximate output fraction).
-///   - Q11 and Q12 selectivity is relative to cartesian product while the others are
-///     relative to probe side.
 const HASH_QUERIES: &[&str] = &[
-    // Q1: INNER 10 x 10K | LOW ~0.1%
-    // equality on key + cheap filter to downselect
-    r#"
-        SELECT t1.value, t2.value
-        FROM generate_series(0, 9000, 1000) AS t1(value)
-        JOIN range(10000) AS t2
-        ON t1.value = t2.value;
-    "#,
-    // Q2: INNER 10 x 10K | LOW ~0.1%
-    r#"
-        SELECT t1.value, t2.value
-        FROM generate_series(0, 9000, 1000) AS t1
-        JOIN range(10000) AS t2
-          ON t1.value = t2.value
-        WHERE t1.value % 5 = 0
-    "#,
-    // Q3: INNER 10K x 10K | HIGH ~90%
-    r#"
-        SELECT t1.value, t2.value
-        FROM range(10000) AS t1
-        JOIN range(10000) AS t2
-          ON t1.value = t2.value
-        WHERE t1.value % 10 <> 0
-    "#,
-    // Q4: INNER 30 x 30K | LOW ~0.1%
-    r#"
-        SELECT t1.value, t2.value
-        FROM generate_series(0, 29000, 1000) AS t1
-        JOIN range(30000) AS t2
-          ON t1.value = t2.value
-        WHERE t1.value % 5 = 0
-    "#,
-    // Q5: INNER 10 x 200K | VERY LOW ~0.005% (small to large)
-    r#"
-        SELECT t1.value, t2.value
-        FROM generate_series(0, 9000, 1000) AS t1
-        JOIN range(200000) AS t2
-          ON t1.value = t2.value
-        WHERE t1.value % 1000 = 0
-    "#,
-    // Q6: INNER 200K x 10 | VERY LOW ~0.005% (large to small)
-    r#"
-        SELECT t1.value, t2.value
-        FROM range(200000) AS t1
-        JOIN generate_series(0, 9000, 1000) AS t2
-          ON t1.value = t2.value
-        WHERE t1.value % 1000 = 0
-    "#,
-    // Q7: RIGHT OUTER 10 x 200K | LOW ~0.1%
-    // Outer join still uses HashJoin for equi-keys; the extra filter reduces matches
-    r#"
-        SELECT t1.value AS l, t2.value AS r
-        FROM generate_series(0, 9000, 1000) AS t1
-        RIGHT JOIN range(200000) AS t2
-          ON t1.value = t2.value
-        WHERE t2.value % 1000 = 0
-    "#,
-    // Q8: LEFT OUTER 200K x 10 | LOW ~0.1%
-    r#"
-        SELECT t1.value AS l, t2.value AS r
-        FROM range(200000) AS t1
-        LEFT JOIN generate_series(0, 9000, 1000) AS t2
-          ON t1.value = t2.value
-        WHERE t1.value % 1000 = 0
-    "#,
-    // Q9: FULL OUTER 30 x 30K | LOW ~0.1%
-    r#"
-        SELECT t1.value AS l, t2.value AS r
-        FROM generate_series(0, 29000, 1000) AS t1
-        FULL JOIN range(30000) AS t2
-          ON t1.value = t2.value
-        WHERE COALESCE(t1.value, t2.value) % 1000 = 0
-    "#,
-    // Q10: FULL OUTER 30 x 30K | HIGH ~90%
-    r#"
-        SELECT t1.value AS l, t2.value AS r
-        FROM generate_series(0, 29000, 1000) AS t1
-        FULL JOIN range(30000) AS t2
-          ON t1.value = t2.value
-        WHERE COALESCE(t1.value, t2.value) % 10 <> 0
-    "#,
-    // Q11: INNER 30 x 30K | MEDIUM ~50% | cheap predicate on parity
-    r#"
-        SELECT t1.value, t2.value
-        FROM generate_series(0, 29000, 1000) AS t1
-        INNER JOIN range(30000) AS t2
-          ON (t1.value % 2) = (t2.value % 2)
-    "#,
-    // Q12: FULL OUTER 30 x 30K | MEDIUM ~50% | expression key
-    r#"
-        SELECT t1.value AS l, t2.value AS r
-        FROM generate_series(0, 29000, 1000) AS t1
-        FULL JOIN range(30000) AS t2
-          ON (t1.value % 2) = (t2.value % 2)
-    "#,
-    // Q13: INNER 30 x 30K | LOW 0.1% | modulo with adding values
-    r#"
-        SELECT t1.value, t2.value
-        FROM generate_series(0, 29000, 1000) AS t1
-        INNER JOIN range(30000) AS t2
-          ON (t1.value = t2.value) AND ((t1.value + t2.value) % 10 < 1)
-    "#,
-    // Q14: FULL OUTER 30 x 30K | ALL ~100% | modulo
-    r#"
-        SELECT t1.value AS l, t2.value AS r
-        FROM generate_series(0, 29000, 1000) AS t1
-        FULL JOIN range(30000) AS t2
-          ON (t1.value = t2.value) AND ((t1.value + t2.value) % 10 = 0)
-    "#,
+    // Q1: Very Small Build Side (Dense)
+    // Build Side: nation (25 rows) | Probe Side: customer (1.5M rows)
+    r#"SELECT n_nationkey FROM nation JOIN customer ON c_nationkey = n_nationkey"#,
+
+    // Q2: 100% Density, 100% Hit rate
+    // Build Side: supplier (100k rows) | Probe Side: lineitem (60M rows)
+    r#"SELECT s_suppkey FROM supplier JOIN lineitem ON s_suppkey = l_suppkey"#,
+
+    // Q3: 100% Density, 10% Hit rate
+    // Build Side: supplier (100k rows) | Probe Side: lineitem (60M rows)
+    r#"SELECT l_suppkey 
+    FROM lineitem 
+    JOIN supplier ON s_suppkey = l_suppkey + (l_suppkey % 10) * 1000000"#,
+
+    // Q4: 90% Density, ~100% Hit rate
+    // Build Side: supplier (100k unique rows) | Probe Side: lineitem (60M rows)
+    r#"SELECT l.k
+    FROM (
+      SELECT l_suppkey * 10 / 9 as k
+      FROM lineitem
+    ) l
+    JOIN (
+      SELECT s_suppkey * 10 / 9 as k FROM supplier
+    ) s ON l.k = s.k"#,
+
+    // Q5: 90% Density, 10% Hit rate
+    // Build Side: supplier (100k unique rows, range 111k) | Probe Side: lineitem (60M rows)
+    r#"SELECT l.k
+    FROM (
+      SELECT CASE WHEN l_suppkey % 10 = 0 
+                  THEN l_suppkey * 10 / 9
+                  ELSE (l_suppkey / 10) * 10 + 9
+             END as k
+      FROM lineitem
+    ) l
+    JOIN (
+      SELECT s_suppkey * 10 / 9 as k FROM supplier
+    ) s ON l.k = s.k"#,
+
+    // Q6: Extremely Sparse Build Side (Small but Wide)
+    // Build Side: 512 rows, Range: 0 to 51,200,000 | Probe Side: 10M rows
+    r#"SELECT build.value
+    FROM range(0, 512 * 100000, 100000) AS build
+    JOIN range(10000000) AS probe ON build.value = probe.value"#,
 ];
 
 impl RunOpt {
@@ -188,6 +122,17 @@ impl RunOpt {
         let config = self.common.config()?;
         let rt_builder = self.common.runtime_env_builder()?;
         let ctx = SessionContext::new_with_config_rt(config, rt_builder.build_arc()?);
+
+        if let Some(path) = &self.path {
+            for table in &["lineitem", "supplier", "nation", "customer"] {
+                let table_path = path.join(table);
+                if !table_path.exists() {
+                    return exec_err!("TPC-H table {} not found at {:?}", table, table_path);
+                }
+                ctx.register_parquet(*table, table_path.to_str().unwrap(), Default::default())
+                    .await?;
+            }
+        }
 
         let mut benchmark_run = BenchmarkRun::new();
 
