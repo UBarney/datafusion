@@ -129,6 +129,7 @@ impl RunOpt {
                 if !table_path.exists() {
                     return exec_err!("TPC-H table {} not found at {:?}", table, table_path);
                 }
+                // TODO: add -f to specify format parqet|csv
                 ctx.register_parquet(*table, table_path.to_str().unwrap(), Default::default())
                     .await?;
             }
