@@ -51,20 +51,13 @@ use datafusion_common::{Result, internal_err};
 /// build side contains `NULL`s, as it does not have a mechanism to store and match `NULL` values.
 #[derive(Debug)]
 pub struct ArrayMap {
+    // data[probSideVal-offset] -> valIdxInBuildSide + 1; 0 for absent
     data: Vec<u32>,
-    offset: u64,
+    offset: u64, // min val in buildSide
     next: Option<Vec<u32>>,
 }
 
 impl ArrayMap {
-    pub fn data(&self) -> &[u32] {
-        &self.data
-    }
-
-    pub fn offset(&self) -> u64 {
-        self.offset
-    }
-
     /// Creates a new [`ArrayKV`] from the given array of join keys.
     ///
     /// Note: This function processes only the non-null values in the input `array`,
@@ -76,7 +69,7 @@ impl ArrayMap {
         array: &ArrayRef,
         offset_val: u64,
         range: usize,
-    ) -> Result<Option<Self>> {
+    ) -> Result<Self> {
         // Initialize with 0 (sentinel for not found)
         let mut data: Vec<u32> = vec![0; range];
         let mut next: Option<Vec<u32>> = None;
@@ -90,7 +83,6 @@ impl ArrayMap {
                         // Calculate index: key - offset
                         let idx = key.wrapping_sub(offset_val) as usize;
                         if idx >= data.len() {
-                            // TODO: 完善报错信息
                             return internal_err!("failed build Array idx >= data.len()");
                         }
 
@@ -123,11 +115,11 @@ impl ArrayMap {
             }
         }
 
-        Ok(Some(Self {
+        Ok(Self {
             data,
             offset: offset_val,
             next,
-        }))
+        })
     }
 
     pub fn get_matched_indices_with_limit_offset(
@@ -204,10 +196,10 @@ impl ArrayMap {
                 build_indices,
             ),
             _ => {
-                return internal_err!(
+                internal_err!(
                     "Unsupported type for ArrayKV lookup: {:?}",
                     array.data_type()
-                );
+                )
             }
         }
     }
@@ -225,98 +217,99 @@ impl ArrayMap {
     {
         probe_indices.clear();
         build_indices.clear();
-        // let (prob_cap, build_cap) = (probe_indices.capacity(), build_indices.capacity());
 
         let arr = array.as_primitive::<T>();
 
-        // arr.values().get_unchecked(index)
         let have_null = arr.null_count() > 0;
 
-        if self.next.is_none() {
-            for prob_idx in current_offset.0..arr.len() {
-                if build_indices.len() == limit {
-                    return Ok(Some((prob_idx, None)));
-                }
+        match &self.next {
+            None => {
+                for prob_idx in current_offset.0..arr.len() {
+                    if build_indices.len() == limit {
+                        return Ok(Some((prob_idx, None)));
+                    }
 
-                // short circuit
-                if have_null && arr.is_null(prob_idx) {
-                    continue;
-                }
-                // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
-                let prob_val = unsafe { arr.value_unchecked(prob_idx) }.as_();
-                let idx_in_build_side = (prob_val.wrapping_sub(self.offset())) as usize;
+                    // short circuit
+                    if have_null && arr.is_null(prob_idx) {
+                        continue;
+                    }
+                    // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
+                    let prob_val = unsafe { arr.value_unchecked(prob_idx) }.as_();
+                    let idx_in_build_side = (prob_val.wrapping_sub(self.offset)) as usize;
 
-                if idx_in_build_side >= self.data().len()
-                    || self.data()[idx_in_build_side] == 0
-                {
-                    continue;
+                    if idx_in_build_side >= self.data.len()
+                        || self.data[idx_in_build_side] == 0
+                    {
+                        continue;
+                    }
+                    build_indices.push((self.data[idx_in_build_side] - 1) as u64);
+                    probe_indices.push(prob_idx as u32);
                 }
-                build_indices.push((self.data()[idx_in_build_side] - 1) as u64);
-                probe_indices.push(prob_idx as u32);
+                Ok(None)
             }
-            return Ok(None);
-        } else {
-            let mut remaining_output = limit;
-            let to_skip = match current_offset {
-                // None `initial_next_idx` indicates that `initial_idx` processing hasn't been started
-                (idx, None) => idx,
-                // Zero `initial_next_idx` indicates that `initial_idx` has been processed during
-                // previous iteration, and it should be skipped
-                (idx, Some(0)) => idx + 1,
-                // Otherwise, process remaining `initial_idx` matches by traversing `next_chain`,
-                // to start with the next index
-                (idx, Some(next_idx)) => {
-                    let is_last = idx == arr.len() - 1;
-                    if let Some(next_offset) = traverse_chain(
-                        self.next.as_ref().unwrap(),
-                        idx,
-                        next_idx as u32, // Cast u64 to u32
+            Some(next) => {
+                let mut remaining_output = limit;
+                let to_skip = match current_offset {
+                    // None `initial_next_idx` indicates that `initial_idx` processing hasn't been started
+                    (idx, None) => idx,
+                    // Zero `initial_next_idx` indicates that `initial_idx` has been processed during
+                    // previous iteration, and it should be skipped
+                    (idx, Some(0)) => idx + 1,
+                    // Otherwise, process remaining `initial_idx` matches by traversing `next_chain`,
+                    // to start with the next index
+                    (idx, Some(next_idx)) => {
+                        let is_last = idx == arr.len() - 1;
+                        if let Some(next_offset) = traverse_chain(
+                            next,
+                            idx,
+                            next_idx as u32,
+                            &mut remaining_output,
+                            probe_indices,
+                            build_indices,
+                            is_last,
+                        ) {
+                            return Ok(Some(next_offset));
+                        }
+                        idx + 1
+                    }
+                };
+
+                for prob_side_idx in to_skip..arr.len() {
+                    if remaining_output == 0 {
+                        return Ok(Some((prob_side_idx, None)));
+                    }
+
+                    if arr.is_null(prob_side_idx) {
+                        continue;
+                    }
+
+                    let is_last = prob_side_idx == arr.len() - 1;
+
+                    let prob_val = unsafe { arr.value_unchecked(prob_side_idx) }.as_();
+                    // todo extract to func
+                    let idx_in_build_side = (prob_val.wrapping_sub(self.offset)) as usize;
+                    if idx_in_build_side >= self.data.len()
+                        || self.data[idx_in_build_side] == 0
+                    {
+                        continue;
+                    }
+
+                    let build_idx = self.data[idx_in_build_side];
+
+                    if let Some(offset) = traverse_chain(
+                        next,
+                        prob_side_idx,
+                        build_idx, // Pass u32 directly
                         &mut remaining_output,
                         probe_indices,
                         build_indices,
                         is_last,
                     ) {
-                        return Ok(Some(next_offset));
+                        return Ok(Some(offset));
                     }
-                    idx + 1
                 }
-            };
-
-            for prob_side_idx in to_skip..arr.len() {
-                if remaining_output == 0 {
-                    return Ok(Some((prob_side_idx, None)));
-                }
-
-                if arr.is_null(prob_side_idx) {
-                    continue;
-                }
-
-                let is_last = prob_side_idx == arr.len() - 1;
-
-                let prob_val = unsafe { arr.value_unchecked(prob_side_idx) }.as_();
-                // todo extract to func
-                let idx_in_build_side = (prob_val.wrapping_sub(self.offset())) as usize;
-                if idx_in_build_side >= self.data().len()
-                    || self.data()[idx_in_build_side] == 0
-                {
-                    continue;
-                }
-
-                let build_idx = self.data()[idx_in_build_side];
-
-                if let Some(offset) = traverse_chain(
-                    self.next.as_ref().unwrap(),
-                    prob_side_idx,
-                    build_idx, // Pass u32 directly
-                    &mut remaining_output,
-                    probe_indices,
-                    build_indices,
-                    is_last,
-                ) {
-                    return Ok(Some(offset));
-                }
+                Ok(None)
             }
-            Ok(None)
         }
     }
 
@@ -339,8 +332,8 @@ impl ArrayMap {
                 for (i, val) in arr.iter().enumerate() {
                     if let Some(val) = val {
                         let key: u64 = val.as_();
-                        let idx = (key.wrapping_sub(self.offset())) as usize;
-                        if idx < self.data().len() && self.data()[idx] != 0 {
+                        let idx = (key.wrapping_sub(self.offset)) as usize;
+                        if idx < self.data.len() && self.data[idx] != 0 {
                             arrow::util::bit_util::set_bit(buf.as_slice_mut(), i);
                         }
                     }
@@ -408,84 +401,6 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_array_map_duplicate_elements() -> Result<()> {
-        // Build side: values and their 0-based indices
-        // Key 5: idx 0, 3, 6
-        // Key 10: idx 1, 4
-        // Key 15: idx 2, 5
-        let build_array: ArrayRef =
-            Arc::new(Int32Array::from(vec![5, 10, 15, 5, 10, 15, 5]));
-        let offset_val = 0;
-        let size = 20; // Max key is 15, so a size of 20 is sufficient
-
-        let array_map = ArrayMap::try_new(&build_array, offset_val, size)?
-            .expect("should create ArrayMap");
-
-        // Verify the internal state for next chain (FIFO order)
-        // Construction iterates backwards: 6, 5, 4, 3, 2, 1, 0
-        // Key 5 (indices 0, 3, 6):
-        // i=6 (val 5): data[5] = 7 (idx 6+1)
-        // i=3 (val 5): next[3] = 7, data[5] = 4
-        // i=0 (val 5): next[0] = 4, data[5] = 1
-
-        // So data[5] -> 1 (idx 0)
-        // next[0] -> 4 (idx 3)
-        // next[3] -> 7 (idx 6)
-        // next[6] -> 0 (end)
-
-        assert_eq!(array_map.data[5], 1); // key 5 -> first index 0
-        assert_eq!(array_map.data[10], 2); // key 10 -> first index 1
-        assert_eq!(array_map.data[15], 3); // key 15 -> first index 2
-
-        let next_chain = array_map.next.as_ref().expect("next chain should exist");
-        assert_eq!(next_chain[0], 4); // idx 0 -> next 3
-        assert_eq!(next_chain[3], 7); // idx 3 -> next 6
-        assert_eq!(next_chain[6], 0); // idx 6 -> end
-
-        assert_eq!(next_chain[1], 5); // idx 1 -> next 4
-        assert_eq!(next_chain[4], 0); // idx 4 -> end
-
-        assert_eq!(next_chain[2], 6); // idx 2 -> next 5
-        assert_eq!(next_chain[5], 0); // idx 5 -> end
-
-        // Probe side
-        let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![5, 10, 15, 20])); // keys 5, 10, 15, 20 (not found)
-        let prob_side_keys = [probe_array.clone()];
-
-        let mut input_indices = Vec::new();
-        let mut match_indices = Vec::new();
-        let batch_size = 100; // Large batch size to get all results at once
-        let initial_offset = (0, None);
-
-        let result_offset = array_map.get_matched_indices_with_limit_offset(
-            &prob_side_keys,
-            batch_size,
-            initial_offset,
-            &mut input_indices,
-            &mut match_indices,
-        )?;
-
-        assert!(result_offset.is_none());
-
-        // Expected matches for probe_array [5, 10, 15, 20]
-        // Probe index 0 (key 5) matches build indices 0, 3, 6 (FIFO)
-        // Probe index 1 (key 10) matches build indices 1, 4 (FIFO)
-        // Probe index 2 (key 15) matches build indices 2, 5 (FIFO)
-
-        let expected_combined =
-            vec![(0, 0), (0, 3), (0, 6), (1, 1), (1, 4), (2, 2), (2, 5)];
-
-        let actual_combined: Vec<(u32, u64)> = input_indices
-            .iter()
-            .zip(match_indices.iter())
-            .map(|(&p, &m)| (p, m))
-            .collect();
-        assert_eq!(actual_combined, expected_combined);
-
-        Ok(())
-    }
-
-    #[test]
     fn test_array_map_limit_offset_duplicate_elements() -> Result<()> {
         // Key 5: idx 0, 3, 6
         // Key 10: idx 1, 4
@@ -497,8 +412,7 @@ mod tests {
         let offset_val = 5;
         let range = 11;
 
-        let array_map = ArrayMap::try_new(&build_array, offset_val, range)?
-            .expect("should create ArrayMap");
+        let array_map = ArrayMap::try_new(&build_array, offset_val, range)?;
 
         let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![5, 10, 15, 7, 8, 9]));
         let prob_side_keys = [probe_array.clone()];
@@ -599,53 +513,53 @@ mod tests {
     }
 
     #[test]
-    fn test_array_map_with_limit_from_user() -> Result<()> {
-        // buildSide: `[1, 3, 5, 7, 8, 8, 10]`
-        // probSide: `[8, 10, 6, 2, 10, 4]`
-        // limit: 2
-        let build_array: ArrayRef =
-            Arc::new(Int32Array::from(vec![1, 3, 5, 7, 8, 8, 10]));
-        // min value is 1, max is 10.
-        let offset_val = 1;
-        let range = 10;
-        let array_map = ArrayMap::try_new(&build_array, offset_val, range)?
-            .expect("should create ArrayMap");
-
-        let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![8, 10, 6, 2, 10, 4]));
-        let prob_side_keys = [probe_array.clone()];
+    fn test_array_map_with_limit_and_misses() -> Result<()> {
+        let build_array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let array_map = ArrayMap::try_new(&build_array, 1, 2)?;
+        let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30, 1, 2]));
+        let prob_side_keys = [probe_array];
 
         let mut prob_indices = Vec::new();
         let mut build_indices = Vec::new();
-        let mut all_prob_indices: Vec<u32> = Vec::new();
-        let mut all_build_indices: Vec<u64> = Vec::new();
-        let batch_size = 2;
-        let mut current_offset = Some((0 as usize, None::<u64>));
 
-        // Expected matches (probe_idx, build_idx):
-        // (0, 4), (0, 5) from probe key 8
-        // (1, 6) from probe key 10
-        // (4, 6) from probe key 10
+        // batch_size=2, first call should skip 3 misses and return 2 hits
+        let result_offset = array_map.get_matched_indices_with_limit_offset(
+            &prob_side_keys,
+            2,
+            (0, None),
+            &mut prob_indices,
+            &mut build_indices,
+        )?;
 
-        // Loop until all matches are found
-        while let Some(offset) = current_offset {
-            let result_offset = array_map.get_matched_indices_with_limit_offset(
-                &prob_side_keys,
-                batch_size,
-                offset,
-                &mut prob_indices,
-                &mut build_indices,
-            )?;
-            all_prob_indices.extend(&prob_indices);
-            all_build_indices.extend(&build_indices);
-            current_offset = result_offset;
-        }
+        assert_eq!(prob_indices, vec![3, 4]);
+        assert_eq!(build_indices, vec![0, 1]);
+        assert!(result_offset.is_none());
+        Ok(())
+    }
 
-        let expected_prob = vec![0, 0, 1, 4];
-        let expected_build = vec![4, 5, 6, 6];
+    #[test]
+    fn test_array_map_with_build_duplicates_and_misses() -> Result<()> {
+        let build_array: ArrayRef = Arc::new(Int32Array::from(vec![1, 1]));
+        let array_map = ArrayMap::try_new(&build_array, 1, 1)?;
+        // prob: 10(m), 1(h1, h2), 20(m), 1(h1, h2)
+        let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![10, 1, 20, 1]));
+        let prob_side_keys = [probe_array];
 
-        assert_eq!(all_prob_indices, expected_prob);
-        assert_eq!(all_build_indices, expected_build);
+        let mut prob_indices = Vec::new();
+        let mut build_indices = Vec::new();
 
+        // batch_size=3, should get 2 matches from first '1' and 1 match from second '1'
+        let result_offset = array_map.get_matched_indices_with_limit_offset(
+            &prob_side_keys,
+            3,
+            (0, None),
+            &mut prob_indices,
+            &mut build_indices,
+        )?;
+
+        assert_eq!(prob_indices, vec![1, 1, 3]);
+        assert_eq!(build_indices, vec![0, 1, 0]);
+        assert_eq!(result_offset, Some((3, Some(2))));
         Ok(())
     }
 }

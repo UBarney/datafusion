@@ -45,7 +45,6 @@ use crate::{
 };
 
 use arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
-use arrow::buffer::Buffer;
 use arrow::compute::BatchCoalescer;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;

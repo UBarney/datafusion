@@ -60,7 +60,7 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{ArrayRef, BooleanBufferBuilder, Int32Array};
+use arrow::array::{ArrayRef, BooleanBufferBuilder};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -86,15 +86,15 @@ use ahash::RandomState;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::TryStreamExt;
-use log::debug;
 use parking_lot::Mutex;
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
 pub(crate) const HASH_JOIN_SEED: RandomState =
     RandomState::with_seeds('J' as u64, 'O' as u64, 'I' as u64, 'N' as u64);
 
-const ARRAY_MAP_CREATED_COUNT_METRIC_NAME: &'static str = "array_map_created_count";
+const ARRAY_MAP_CREATED_COUNT_METRIC_NAME: &str = "array_map_created_count";
 
+#[expect(clippy::too_many_arguments)]
 fn try_create_array_map(
     bounds: &Option<PartitionBounds>,
     schema: &SchemaRef,
@@ -153,18 +153,12 @@ fn try_create_array_map(
     };
 
     if min_val > max_val {
-        return internal_err!("min_val>max_val"); // TODO: more detail
+        return internal_err!("min_val>max_val");
     }
 
     let range = max_val - min_val;
     let num_row: usize = batches.iter().map(|x| x.num_rows()).sum();
     let dense_ratio = (num_row as f64) / ((range + 1) as f64);
-    // if dense_ratio > dense_ratio_threshold {
-    //     debug!(
-    //         "dense! ratio: {}, range: {}, len: {}",
-    //         dense_ratio, range, num_row
-    //     );
-    // }
 
     // TODO: support create ArrayMap<u64>
     if num_row >= u32::MAX as usize {
@@ -174,7 +168,6 @@ fn try_create_array_map(
     if range > perfect_hash_join_small_build_threshold as i128
         && dense_ratio < perfect_hash_join_min_key_density
     {
-        // dbg!(range, num_row);
         return Ok(None);
     }
 
@@ -182,26 +175,18 @@ fn try_create_array_map(
 
     // todo: move compute mem usage to ArrayMap
     let size = (range + 1) as usize;
-    let mem_size = size * size_of::<u32>();
+    let mem_size = size * size_of::<u32>() /*arrayMap.data*/ + num_row * size_of::<u32>()/*arrayMap.next*/;
 
     reservation.try_grow(mem_size)?;
 
-    let batch = concat_batches(&schema, batches)?;
+    let batch = concat_batches(schema, batches)?;
     let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
     let array_map = ArrayMap::try_new(&left_values[0], offset_val, size)?;
 
-    match array_map {
-        Some(array_map) => {
-            // TODO: move to caller
-            metrics.build_mem_used.add(mem_size);
-            Ok(Some((array_map, batch, left_values)))
-        }
-        None => {
-            reservation.shrink(mem_size);
-            Ok(None)
-        }
-    }
+    // TODO: move to caller ?
+    metrics.build_mem_used.add(mem_size);
+    Ok(Some((array_map, batch, left_values)))
 }
 
 /// HashTable and input data for the left (build side) of a join
@@ -1041,16 +1026,6 @@ impl ExecutionPlan for HashJoinExec {
         let array_map_created_count = MetricBuilder::new(&self.metrics)
             .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, partition);
 
-        let perfect_hash_join_small_build_threshold = context
-            .session_config()
-            .options()
-            .execution
-            .perfect_hash_join_small_build_threshold;
-        let perfect_hash_join_min_key_density = context
-            .session_config()
-            .options()
-            .execution
-            .perfect_hash_join_min_key_density;
         let left_fut = match self.mode {
             PartitionMode::CollectLeft => self.left_fut.try_once(|| {
                 let left_stream = self.left.execute(0, Arc::clone(&context))?;
@@ -1067,18 +1042,7 @@ impl ExecutionPlan for HashJoinExec {
                     need_produce_result_in_final(self.join_type),
                     self.right().output_partitioning().partition_count(),
                     enable_dynamic_filter_pushdown,
-                    context
-                        .session_config()
-                        .options()
-                        .optimizer
-                        .hash_join_inlist_pushdown_max_size,
-                    context
-                        .session_config()
-                        .options()
-                        .optimizer
-                        .hash_join_inlist_pushdown_max_distinct_values,
-                    perfect_hash_join_small_build_threshold,
-                    perfect_hash_join_min_key_density,
+                    Arc::clone(context.session_config().options()),
                     self.null_equality,
                     array_map_created_count,
                 ))
@@ -1099,18 +1063,7 @@ impl ExecutionPlan for HashJoinExec {
                     need_produce_result_in_final(self.join_type),
                     1,
                     enable_dynamic_filter_pushdown,
-                    context
-                        .session_config()
-                        .options()
-                        .optimizer
-                        .hash_join_inlist_pushdown_max_size,
-                    context
-                        .session_config()
-                        .options()
-                        .optimizer
-                        .hash_join_inlist_pushdown_max_distinct_values,
-                    perfect_hash_join_small_build_threshold,
-                    perfect_hash_join_min_key_density,
+                    Arc::clone(context.session_config().options()),
                     self.null_equality,
                     array_map_created_count,
                 ))
@@ -1540,10 +1493,7 @@ async fn collect_left_input(
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
     should_compute_dynamic_filters: bool,
-    max_inlist_size: usize,
-    max_inlist_distinct_values: usize,
-    perfect_hash_join_small_build_threshold: usize,
-    perfect_hash_join_min_key_density: f64,
+    config: Arc<ConfigOptions>,
     null_equality: NullEquality,
     array_map_created_count: Count,
 ) -> Result<JoinLeftData> {
@@ -1618,8 +1568,8 @@ async fn collect_left_input(
             &on_left,
             &mut reservation,
             &metrics,
-            perfect_hash_join_small_build_threshold,
-            perfect_hash_join_min_key_density,
+            config.execution.perfect_hash_join_small_build_threshold,
+            config.execution.perfect_hash_join_min_key_density,
             null_equality,
         )? {
             array_map_created_count.add(1);
@@ -1702,8 +1652,11 @@ async fn collect_left_input(
             .sum::<usize>();
         if left_values.is_empty()
             || left_values[0].is_empty()
-            || estimated_size > max_inlist_size
-            || join_hash_map.len() > max_inlist_distinct_values
+            || estimated_size > config.optimizer.hash_join_inlist_pushdown_max_size
+            || join_hash_map.len()
+                > config
+                    .optimizer
+                    .hash_join_inlist_pushdown_max_distinct_values
         {
             PushdownStrategy::HashTable(Arc::clone(&join_hash_map))
         } else if let Some(in_list_values) = build_struct_inlist_values(&left_values)? {

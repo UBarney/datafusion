@@ -288,6 +288,7 @@ impl PhysicalExpr for HashTableLookupExpr {
 
         match self.hash_map.as_ref() {
             Map::HashMap(hash_map) => {
+                // TODO: maybe we can avoid traversing `hash_map.next`
                 // Check each hash against the hash table
                 for (idx, hash_value) in hash_array.values().iter().enumerate() {
                     // Use get_matched_indices to check - if it returns any indices, the hash exists
