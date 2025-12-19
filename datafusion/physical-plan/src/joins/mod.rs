@@ -20,7 +20,7 @@
 use arrow::array::BooleanBufferBuilder;
 pub use cross_join::CrossJoinExec;
 use datafusion_physical_expr::PhysicalExprRef;
-pub use hash_join::HashJoinExec;
+pub use hash_join::{HashJoinExec, HashTableLookupExpr};
 pub use nested_loop_join::NestedLoopJoinExec;
 use parking_lot::Mutex;
 // Note: SortMergeJoin is not used in plans yet
@@ -38,7 +38,11 @@ pub mod utils;
 pub mod chain;
 
 mod join_filter;
-mod join_hash_map;
+/// Hash map implementations for join operations.
+///
+/// Note: This module is public for internal testing purposes only
+/// and is not guaranteed to be stable across versions.
+pub mod join_hash_map;
 mod array_map;
 
 #[cfg(test)]

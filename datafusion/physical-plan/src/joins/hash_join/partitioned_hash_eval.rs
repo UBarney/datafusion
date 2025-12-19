@@ -43,7 +43,7 @@ use crate::{hash_utils::create_hashes, joins::array_map::Map};
 /// This is used for:
 /// - Computing routing hashes (with RepartitionExec's 0,0,0,0 seeds)
 /// - Computing lookup hashes (with HashJoin's 'J','O','I','N' seeds)
-pub(super) struct HashExpr {
+pub struct HashExpr {
     /// Columns to hash
     on_columns: Vec<PhysicalExprRef>,
     /// Random state for hashing
@@ -183,7 +183,11 @@ impl HashTableLookupExpr {
     /// * `right_expr` - The right expressions to check equality
     /// * `hash_map` - Hash table to check membership
     /// * `description` - Description for debugging
-    pub(super) fn new(
+    ///
+    /// # Note
+    /// This is public for internal testing purposes only and is not
+    /// guaranteed to be stable across versions.
+    pub fn new(
         hash_expr: PhysicalExprRef,
         right_expr: Vec<PhysicalExprRef>,
         hash_map: Arc<Map>,
