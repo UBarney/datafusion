@@ -36,7 +36,7 @@ use futures::StreamExt;
 #[derive(Debug, StructOpt, Clone)]
 #[structopt(verbatim_doc_comment)]
 pub struct RunOpt {
-    /// Query number (between 1 and 20). If not specified, runs all queries
+    /// Query number. If not specified, runs all queries
     #[structopt(short, long)]
     query: Option<usize>,
 
@@ -44,7 +44,7 @@ pub struct RunOpt {
     #[structopt(flatten)]
     common: CommonOpt,
 
-    /// Path to TPC-H data (required for TPC-H queries)
+    /// Path to TPC-H SF10 data
     #[structopt(parse(from_os_str), short = "p", long = "path")]
     path: Option<PathBuf>,
 
