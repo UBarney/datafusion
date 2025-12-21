@@ -36,7 +36,7 @@ use futures::StreamExt;
 #[derive(Debug, StructOpt, Clone)]
 #[structopt(verbatim_doc_comment)]
 pub struct RunOpt {
-    /// Query number (between 1 and 6). If not specified, runs all queries
+    /// Query number (between 1 and 20). If not specified, runs all queries
     #[structopt(short, long)]
     query: Option<usize>,
 
@@ -53,52 +53,234 @@ pub struct RunOpt {
     output_path: Option<PathBuf>,
 }
 
+struct HashJoinQuery {
+    sql: &'static str,
+    density: f64,
+    prob_hit: f64,
+    build_size: &'static str,
+    probe_size: &'static str,
+}
+
 /// Inline SQL queries for Hash Join benchmarks
-const HASH_QUERIES: &[&str] = &[
+const HASH_QUERIES: &[HashJoinQuery] = &[
     // Q1: Very Small Build Side (Dense)
     // Build Side: nation (25 rows) | Probe Side: customer (1.5M rows)
-    r#"SELECT n_nationkey FROM nation JOIN customer ON c_nationkey = n_nationkey"#,
-
-    // Q2: 100% Density, 100% Hit rate
-    // Build Side: supplier (100k rows) | Probe Side: lineitem (60M rows)
-    r#"SELECT s_suppkey FROM supplier JOIN lineitem ON s_suppkey = l_suppkey"#,
-
-    // Q3: 100% Density, 10% Hit rate
-    // Build Side: supplier (100k rows) | Probe Side: lineitem (60M rows)
-    r#"SELECT l_suppkey 
-    FROM lineitem 
-    JOIN supplier ON s_suppkey = l_suppkey + (l_suppkey % 10) * 1000000"#,
-
-    // Q4: 90% Density, ~100% Hit rate
-    // Build Side: supplier (100k unique rows) | Probe Side: lineitem (60M rows)
-    r#"SELECT l.k
+    HashJoinQuery {
+        sql: r###"SELECT n_nationkey FROM nation JOIN customer ON c_nationkey = n_nationkey"###,
+        density: 1.0,
+        prob_hit: 1.0,
+        build_size: "25",
+        probe_size: "1.5M",
+    },
+    // Q2: Very Small Build Side (Sparse, range < 1024)
+    // Build Side: nation (25 rows, range 961) | Probe Side: customer (1.5M rows)
+    HashJoinQuery {
+        sql: r###"SELECT l.k
     FROM (
-      SELECT l_suppkey * 10 / 9 as k
-      FROM lineitem
+      SELECT c_nationkey * 40 as k
+      FROM customer
     ) l
     JOIN (
-      SELECT s_suppkey * 10 / 9 as k FROM supplier
-    ) s ON l.k = s.k"#,
-
-    // Q5: 90% Density, 10% Hit rate
-    // Build Side: supplier (100k unique rows, range 111k) | Probe Side: lineitem (60M rows)
-    r#"SELECT l.k
-    FROM (
-      SELECT CASE WHEN l_suppkey % 10 = 0 
-                  THEN l_suppkey * 10 / 9
-                  ELSE (l_suppkey / 10) * 10 + 9
-             END as k
-      FROM lineitem
-    ) l
-    JOIN (
-      SELECT s_suppkey * 10 / 9 as k FROM supplier
-    ) s ON l.k = s.k"#,
-
-    // Q6: Extremely Sparse Build Side (Small but Wide)
-    // Build Side: 512 rows, Range: 0 to 51,200,000 | Probe Side: 10M rows
-    r#"SELECT build.value
-    FROM range(0, 512 * 100000, 100000) AS build
-    JOIN range(10000000) AS probe ON build.value = probe.value"#,
+      SELECT n_nationkey * 40 as k FROM nation
+    ) s ON l.k = s.k"###,
+        density: 0.026,
+        prob_hit: 1.0,
+        build_size: "25",
+        probe_size: "1.5M",
+    },
+    // Q3: 100% Density, 100% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT s_suppkey FROM supplier JOIN lineitem ON s_suppkey = l_suppkey"###,
+        density: 1.0,
+        prob_hit: 1.0,
+        build_size: "100K",
+        probe_size: "60M",
+    },
+    // Q4: 100% Density, 10% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT l.k
+        FROM (
+          SELECT CASE WHEN l_suppkey % 10 = 0 THEN l_suppkey ELSE l_suppkey + 1000000 END as k
+          FROM lineitem
+        ) l
+        JOIN (
+          SELECT s_suppkey as k FROM supplier
+        ) s ON l.k = s.k"###,
+        density: 1.0,
+        prob_hit: 0.1,
+        build_size: "100K",
+        probe_size: "60M",
+    },
+    // Q5: 75% Density, 100% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT l.k
+        FROM (
+          SELECT l_suppkey * 4 / 3 as k
+          FROM lineitem
+        ) l
+        JOIN (
+          SELECT s_suppkey * 4 / 3 as k FROM supplier
+        ) s ON l.k = s.k"###,
+        density: 0.75,
+        prob_hit: 1.0,
+        build_size: "100K",
+        probe_size: "60M",
+    },
+    // Q6: 75% Density, 10% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT l.k
+        FROM (
+          SELECT CASE 
+                      WHEN l_suppkey % 10 = 0 THEN l_suppkey * 4 / 3
+                      WHEN l_suppkey % 10 < 9 THEN (l_suppkey * 4 / 3 / 4) * 4 + 3 -- hole
+                      ELSE l_suppkey * 4 / 3 + 1000000                            -- oob
+                 END as k
+          FROM lineitem
+        ) l
+        JOIN (
+          SELECT s_suppkey * 4 / 3 as k FROM supplier
+        ) s ON l.k = s.k"###,
+        density: 0.75,
+        prob_hit: 0.1,
+        build_size: "100K",
+        probe_size: "60M",
+    },
+    // Q7: 50% Density, 100% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT l.k
+        FROM (
+          SELECT l_suppkey * 2 as k
+          FROM lineitem
+        ) l
+        JOIN (
+          SELECT s_suppkey * 2 as k FROM supplier
+        ) s ON l.k = s.k"###,
+        density: 0.5,
+        prob_hit: 1.0,
+        build_size: "100K",
+        probe_size: "60M",
+    },
+    // Q8: 50% Density, 10% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT l.k
+        FROM (
+          SELECT CASE 
+                      WHEN l_suppkey % 10 = 0 THEN l_suppkey * 2
+                      WHEN l_suppkey % 10 < 9 THEN l_suppkey * 2 + 1 -- hole
+                      ELSE l_suppkey * 2 + 1000000                   -- oob
+                 END as k
+          FROM lineitem
+        ) l
+        JOIN (
+          SELECT s_suppkey * 2 as k FROM supplier
+        ) s ON l.k = s.k"###,
+        density: 0.5,
+        prob_hit: 0.1,
+        build_size: "100K",
+        probe_size: "60M",
+    },
+    // Q9: 20% Density, 100% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT l.k
+        FROM (
+          SELECT l_suppkey * 5 as k
+          FROM lineitem
+        ) l
+        JOIN (
+          SELECT s_suppkey * 5 as k FROM supplier
+        ) s ON l.k = s.k"###,
+        density: 0.2,
+        prob_hit: 1.0,
+        build_size: "100K",
+        probe_size: "60M",
+    },
+    // Q10: 20% Density, 10% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT l.k
+        FROM (
+          SELECT CASE 
+                      WHEN l_suppkey % 10 = 0 THEN l_suppkey * 5
+                      WHEN l_suppkey % 10 < 9 THEN l_suppkey * 5 + 1 -- hole
+                      ELSE l_suppkey * 5 + 1000000                   -- oob
+                 END as k
+          FROM lineitem
+        ) l
+        JOIN (
+          SELECT s_suppkey * 5 as k FROM supplier
+        ) s ON l.k = s.k"###,
+        density: 0.2,
+        prob_hit: 0.1,
+        build_size: "100K",
+        probe_size: "60M",
+    },
+    // Q11: 10% Density, 100% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT l.k
+        FROM (
+          SELECT l_suppkey * 10 as k
+          FROM lineitem
+        ) l
+        JOIN (
+          SELECT s_suppkey * 10 as k FROM supplier
+        ) s ON l.k = s.k"###,
+        density: 0.1,
+        prob_hit: 1.0,
+        build_size: "100K",
+        probe_size: "60M",
+    },
+    // Q12: 10% Density, 10% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT l.k
+        FROM (
+          SELECT CASE 
+                      WHEN l_suppkey % 10 = 0 THEN l_suppkey * 10
+                      WHEN l_suppkey % 10 < 9 THEN l_suppkey * 10 + 1 -- hole
+                      ELSE l_suppkey * 10 + 1000000                   -- oob
+                 END as k
+          FROM lineitem
+        ) l
+        JOIN (
+          SELECT s_suppkey * 10 as k FROM supplier
+        ) s ON l.k = s.k"###,
+        density: 0.1,
+        prob_hit: 0.1,
+        build_size: "100K",
+        probe_size: "60M",
+    },
+    // Q13: 1% Density, 100% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT l.k
+        FROM (
+          SELECT l_suppkey * 100 as k
+          FROM lineitem
+        ) l
+        JOIN (
+          SELECT s_suppkey * 100 as k FROM supplier
+        ) s ON l.k = s.k"###,
+        density: 0.01,
+        prob_hit: 1.0,
+        build_size: "100K",
+        probe_size: "60M",
+    },
+    // Q14: 1% Density, 10% Hit rate
+    HashJoinQuery {
+        sql: r###"SELECT l.k
+        FROM (
+          SELECT CASE 
+                      WHEN l_suppkey % 10 = 0 THEN l_suppkey * 100
+                      WHEN l_suppkey % 10 < 9 THEN l_suppkey * 100 + 1 -- hole
+                      ELSE l_suppkey * 100 + 11000000                  -- oob
+                 END as k
+          FROM lineitem
+        ) l
+            JOIN (
+              SELECT s_suppkey * 100 as k FROM supplier
+            ) s ON l.k = s.k"###,
+        density: 0.01,
+        prob_hit: 0.1,
+        build_size: "100K",
+        probe_size: "60M",
+    },
 ];
 
 impl RunOpt {
@@ -127,11 +309,19 @@ impl RunOpt {
             for table in &["lineitem", "supplier", "nation", "customer"] {
                 let table_path = path.join(table);
                 if !table_path.exists() {
-                    return exec_err!("TPC-H table {} not found at {:?}", table, table_path);
+                    return exec_err!(
+                        "TPC-H table {} not found at {:?}",
+                        table,
+                        table_path
+                    );
                 }
                 // TODO: add -f to specify format parqet|csv
-                ctx.register_parquet(*table, table_path.to_str().unwrap(), Default::default())
-                    .await?;
+                ctx.register_parquet(
+                    *table,
+                    table_path.to_str().unwrap(),
+                    Default::default(),
+                )
+                .await?;
             }
         }
 
@@ -139,10 +329,19 @@ impl RunOpt {
 
         for query_id in query_range {
             let query_index = query_id - 1;
-            let sql = HASH_QUERIES[query_index];
+            let query = &HASH_QUERIES[query_index];
 
-            benchmark_run.start_new_case(&format!("Query {query_id}"));
-            let query_run = self.benchmark_query(sql, &query_id.to_string(), &ctx).await;
+            let case_name = format!(
+                "Query {}_density={}_prob_hit={}_{}*{}",
+                query_id,
+                query.density,
+                query.prob_hit,
+                query.build_size,
+                query.probe_size
+            );
+            benchmark_run.start_new_case(&case_name);
+
+            let query_run = self.benchmark_query(query.sql, &query_id.to_string(), &ctx).await;
             match query_run {
                 Ok(query_results) => {
                     for iter in query_results {
