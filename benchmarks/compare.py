@@ -157,8 +157,8 @@ def compare(
     console = Console(width=200)
 
     # use basename as the column names
-    baseline_header = baseline_path.parent.stem
-    comparison_header = comparison_path.parent.stem
+    baseline_header = baseline_path.parent.name
+    comparison_header = comparison_path.parent.name
 
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Query", style="dim", no_wrap=True)
