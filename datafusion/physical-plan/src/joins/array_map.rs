@@ -18,7 +18,6 @@
 use arrow::buffer::MutableBuffer;
 use num_traits::AsPrimitive;
 use std::fmt;
-use std::sync::Arc;
 
 use crate::joins::chain::traverse_chain;
 use crate::joins::join_hash_map::JoinHashMapOffset;
@@ -362,7 +361,7 @@ impl ArrayMap {
 }
 
 pub enum Map {
-    HashMap(Arc<dyn JoinHashMapType>),
+    HashMap(Box<dyn JoinHashMapType>),
     ArrayMap(ArrayMap),
 }
 

@@ -213,14 +213,22 @@ impl PhysicalExpr for HashExpr {
     }
 }
 
-/// Physical expression that checks if hash values exist in a hash table
+/// Physical expression that checks if values exist in a hash table
 ///
-/// Takes a UInt64Array of hash values and checks membership in a hash table.
-/// Returns a BooleanArray indicating which hashes exist.
+/// This expression is used for dynamic filtering. It checks if values in the
+/// input batch exist in a pre-built hash table.
+///
+/// It supports two types of lookups based on the underlying [`Map`] implementation:
+/// 1. [`Map::HashMap`]: Uses pre-computed hash values (from `hash_expr`) to perform lookups.
+/// 2. [`Map::ArrayMap`]: Uses raw join key values (from `right_expr`) to perform direct
+///    lookups in a dense array (Perfect Hash).
+///
+/// TODO: Refactor fields to avoid redundancy. `hash_expr` is only used for `Map::HashMap`,
+/// while `right_expr` is only used for `Map::ArrayMap`.
 pub struct HashTableLookupExpr {
-    /// Expression that computes hash values (should be a HashExpr)
+    /// Expression that computes hash values (used when `hash_map` is [`Map::HashMap`])
     hash_expr: PhysicalExprRef,
-    /// The right expressions to check equality
+    /// The expressions to check membership (used when `hash_map` is [`Map::ArrayMap`])
     right_expr: Vec<PhysicalExprRef>,
     /// Hash table to check against
     hash_map: Arc<Map>,
@@ -232,8 +240,8 @@ impl HashTableLookupExpr {
     /// Create a new HashTableLookupExpr
     ///
     /// # Arguments
-    /// * `hash_expr` - Expression that computes hash values
-    /// * `right_expr` - The right expressions to check equality
+    /// * `hash_expr` - Expression that computes hash values (used for [`Map::HashMap`])
+    /// * `right_expr` - The expressions to check membership (used for [`Map::ArrayMap`])
     /// * `hash_map` - Hash table to check membership
     /// * `description` - Description for debugging
     ///
@@ -344,19 +352,20 @@ impl PhysicalExpr for HashTableLookupExpr {
     ) -> Result<ColumnarValue> {
         let num_rows = batch.num_rows();
 
-        // Evaluate hash expression to get hash values
-        let hash_array = self.hash_expr.evaluate(batch)?.into_array(num_rows)?;
-        let hash_array = hash_array.as_any().downcast_ref::<UInt64Array>().ok_or(
-            internal_datafusion_err!(
-                "HashTableLookupExpr expects UInt64Array from hash expression"
-            ),
-        )?;
-
         let mut buf: MutableBuffer =
             MutableBuffer::from_len_zeroed(bit_util::ceil(num_rows, 8));
 
         match self.hash_map.as_ref() {
             Map::HashMap(hash_map) => {
+                // Evaluate hash expression to get hash values
+                let hash_array = self.hash_expr.evaluate(batch)?.into_array(num_rows)?;
+                let hash_array = hash_array
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or(internal_datafusion_err!(
+                        "HashTableLookupExpr expects UInt64Array from hash expression"
+                    ))?;
+
                 // TODO: maybe we can avoid traversing `hash_map.next`
                 // Check each hash against the hash table
                 for (idx, hash_value) in hash_array.values().iter().enumerate() {
@@ -372,8 +381,7 @@ impl PhysicalExpr for HashTableLookupExpr {
                 }
             }
             Map::ArrayMap(array_map) => {
-                let right =
-                    evaluate_expressions_to_arrays(&self.right_expr, batch)?;
+                let right = evaluate_expressions_to_arrays(&self.right_expr, batch)?;
                 array_map.mark_existing_probes(&right, &mut buf)?;
             }
         }
@@ -511,17 +519,19 @@ mod tests {
             SeededRandomState::with_seeds(1, 2, 3, 4),
             "inner_hash".to_string(),
         ));
-        let hash_map: Arc<dyn JoinHashMapType> =
-            Arc::new(JoinHashMapU32::with_capacity(10));
+        let hash_map =
+            Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(10))));
 
         let expr1 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
+            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );
 
         let expr2 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
+            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );
@@ -546,17 +556,19 @@ mod tests {
             "inner_hash".to_string(),
         ));
 
-        let hash_map: Arc<dyn JoinHashMapType> =
-            Arc::new(JoinHashMapU32::with_capacity(10));
+        let hash_map =
+            Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(10))));
 
         let expr1 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr1),
+            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );
 
         let expr2 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr2),
+            vec![Arc::clone(&col_b)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );
@@ -572,17 +584,19 @@ mod tests {
             SeededRandomState::with_seeds(1, 2, 3, 4),
             "inner_hash".to_string(),
         ));
-        let hash_map: Arc<dyn JoinHashMapType> =
-            Arc::new(JoinHashMapU32::with_capacity(10));
+        let hash_map =
+            Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(10))));
 
         let expr1 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
+            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup_one".to_string(),
         );
 
         let expr2 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
+            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup_two".to_string(),
         );
@@ -600,19 +614,20 @@ mod tests {
         ));
 
         // Two different Arc pointers (even with same content) should not be equal
-        let hash_map1: Arc<dyn JoinHashMapType> =
-            Arc::new(JoinHashMapU32::with_capacity(10));
-        let hash_map2: Arc<dyn JoinHashMapType> =
-            Arc::new(JoinHashMapU32::with_capacity(10));
-
+        let hash_map1 =
+            Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(10))));
+        let hash_map2 =
+            Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(10))));
         let expr1 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
+            vec![Arc::clone(&col_a)],
             hash_map1,
             "lookup".to_string(),
         );
 
         let expr2 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
+            vec![Arc::clone(&col_a)],
             hash_map2,
             "lookup".to_string(),
         );
@@ -629,17 +644,19 @@ mod tests {
             SeededRandomState::with_seeds(1, 2, 3, 4),
             "inner_hash".to_string(),
         ));
-        let hash_map: Arc<dyn JoinHashMapType> =
-            Arc::new(JoinHashMapU32::with_capacity(10));
+        let hash_map =
+            Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(10))));
 
         let expr1 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
+            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );
 
         let expr2 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
+            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );
