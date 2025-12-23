@@ -26,7 +26,7 @@ use arrow::{
     datatypes::{DataType, Schema},
     util::bit_util,
 };
-use datafusion_common::{Result, internal_datafusion_err, internal_err};
+use datafusion_common::{Result, internal_datafusion_err};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr_common::{
     physical_expr::{DynHash, PhysicalExpr, PhysicalExprRef},
@@ -213,25 +213,16 @@ impl PhysicalExpr for HashExpr {
     }
 }
 
-/// Physical expression that checks if values exist in a hash table
+/// Physical expression that checks membership in a [`Map`] (hash table or array map).
 ///
-/// This expression is used for dynamic filtering. It checks if values in the
-/// input batch exist in a pre-built hash table.
-///
-/// It supports two types of lookups based on the underlying [`Map`] implementation:
-/// 1. [`Map::HashMap`]: Uses pre-computed hash values (from `hash_expr`) to perform lookups.
-/// 2. [`Map::ArrayMap`]: Uses raw join key values (from `right_expr`) to perform direct
-///    lookups in a dense array (Perfect Hash).
-///
-/// TODO: Refactor fields to avoid redundancy. `hash_expr` is only used for `Map::HashMap`,
-/// while `right_expr` is only used for `Map::ArrayMap`.
+/// Returns a [`BooleanArray`] indicating if join keys (from `hash_expr`) exist in the map.
+/// Delegates `children()` to `hash_expr` to expose the underlying join key columns.
+// TODO: rename to MapLookupExpr
 pub struct HashTableLookupExpr {
-    /// Expression that computes hash values (used when `hash_map` is [`Map::HashMap`])
-    hash_expr: PhysicalExprRef,
-    /// The expressions to check membership (used when `hash_map` is [`Map::ArrayMap`])
-    right_expr: Vec<PhysicalExprRef>,
-    /// Hash table to check against
-    hash_map: Arc<Map>,
+    /// Expression that computes hash values and identifies join key columns
+    hash_expr: Arc<HashExpr>,
+    /// Map to check against
+    map: Arc<Map>,
     /// Description for display
     description: String,
 }
@@ -239,25 +230,13 @@ pub struct HashTableLookupExpr {
 impl HashTableLookupExpr {
     /// Create a new HashTableLookupExpr
     ///
-    /// # Arguments
-    /// * `hash_expr` - Expression that computes hash values (used for [`Map::HashMap`])
-    /// * `right_expr` - The expressions to check membership (used for [`Map::ArrayMap`])
-    /// * `hash_map` - Hash table to check membership
-    /// * `description` - Description for debugging
-    ///
     /// # Note
     /// This is public for internal testing purposes only and is not
     /// guaranteed to be stable across versions.
-    pub fn new(
-        hash_expr: PhysicalExprRef,
-        right_expr: Vec<PhysicalExprRef>,
-        hash_map: Arc<Map>,
-        description: String,
-    ) -> Self {
+    pub fn new(hash_expr: Arc<HashExpr>, map: Arc<Map>, description: String) -> Self {
         Self {
             hash_expr,
-            right_expr,
-            hash_map,
+            map,
             description,
         }
     }
@@ -265,18 +244,13 @@ impl HashTableLookupExpr {
 
 impl std::fmt::Debug for HashTableLookupExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}(hash_expr={:?}, right_expr={:?})",
-            self.description, self.hash_expr, self.right_expr
-        )
+        write!(f, "{}({:?})", self.description, self.hash_expr)
     }
 }
 
 impl Hash for HashTableLookupExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.hash_expr.dyn_hash(state);
-        self.right_expr.dyn_hash(state);
         self.description.hash(state);
         // Note that we compare hash_map by pointer equality.
         // Actually comparing the contents of the hash maps would be expensive.
@@ -285,7 +259,7 @@ impl Hash for HashTableLookupExpr {
         // hash maps to have the same content in practice.
         // Theoretically this is a public API and users could create identical hash maps,
         // but that seems unlikely and not worth paying the cost of deep comparison all the time.
-        Arc::as_ptr(&self.hash_map).hash(state);
+        Arc::as_ptr(&self.map).hash(state);
     }
 }
 
@@ -300,7 +274,7 @@ impl PartialEq for HashTableLookupExpr {
         // but that seems unlikely and not worth paying the cost of deep comparison all the time.
         self.hash_expr.as_ref() == other.hash_expr.as_ref()
             && self.description == other.description
-            && Arc::ptr_eq(&self.hash_map, &other.hash_map)
+            && Arc::ptr_eq(&self.map, &other.map)
     }
 }
 
@@ -318,22 +292,21 @@ impl PhysicalExpr for HashTableLookupExpr {
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
-        let mut children = vec![&self.hash_expr];
-        children.extend(self.right_expr.iter());
-        children
+        self.hash_expr.children()
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        if children.is_empty() {
-            return internal_err!("HashTableLookupExpr expects at least 1 child, got 0");
-        }
-        Ok(Arc::new(HashTableLookupExpr::new(
-            Arc::clone(&children[0]),
-            children[1..].to_vec(),
-            Arc::clone(&self.hash_map),
+        let hash_expr = Arc::new(HashExpr::new(
+            children,
+            self.hash_expr.random_state.clone(),
+            self.hash_expr.description.clone(),
+        ));
+        Ok(Arc::new(Self::new(
+            hash_expr,
+            Arc::clone(&self.map),
             self.description.clone(),
         )))
     }
@@ -355,7 +328,7 @@ impl PhysicalExpr for HashTableLookupExpr {
         let mut buf: MutableBuffer =
             MutableBuffer::from_len_zeroed(bit_util::ceil(num_rows, 8));
 
-        match self.hash_map.as_ref() {
+        match self.map.as_ref() {
             Map::HashMap(hash_map) => {
                 // Evaluate hash expression to get hash values
                 let hash_array = self.hash_expr.evaluate(batch)?.into_array(num_rows)?;
@@ -381,7 +354,8 @@ impl PhysicalExpr for HashTableLookupExpr {
                 }
             }
             Map::ArrayMap(array_map) => {
-                let right = evaluate_expressions_to_arrays(&self.right_expr, batch)?;
+                let right =
+                    evaluate_expressions_to_arrays(self.hash_expr.on_columns(), batch)?;
                 array_map.mark_existing_probes(&right, &mut buf)?;
             }
         }
@@ -514,7 +488,7 @@ mod tests {
     #[test]
     fn test_hash_table_lookup_expr_eq_same() {
         let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
-        let hash_expr: PhysicalExprRef = Arc::new(HashExpr::new(
+        let hash_expr = Arc::new(HashExpr::new(
             vec![Arc::clone(&col_a)],
             SeededRandomState::with_seeds(1, 2, 3, 4),
             "inner_hash".to_string(),
@@ -524,14 +498,12 @@ mod tests {
 
         let expr1 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
-            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );
 
         let expr2 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
-            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );
@@ -544,13 +516,13 @@ mod tests {
         let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
         let col_b: PhysicalExprRef = Arc::new(Column::new("b", 1));
 
-        let hash_expr1: PhysicalExprRef = Arc::new(HashExpr::new(
+        let hash_expr1 = Arc::new(HashExpr::new(
             vec![Arc::clone(&col_a)],
             SeededRandomState::with_seeds(1, 2, 3, 4),
             "inner_hash".to_string(),
         ));
 
-        let hash_expr2: PhysicalExprRef = Arc::new(HashExpr::new(
+        let hash_expr2 = Arc::new(HashExpr::new(
             vec![Arc::clone(&col_b)],
             SeededRandomState::with_seeds(1, 2, 3, 4),
             "inner_hash".to_string(),
@@ -561,14 +533,12 @@ mod tests {
 
         let expr1 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr1),
-            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );
 
         let expr2 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr2),
-            vec![Arc::clone(&col_b)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );
@@ -579,7 +549,7 @@ mod tests {
     #[test]
     fn test_hash_table_lookup_expr_eq_different_description() {
         let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
-        let hash_expr: PhysicalExprRef = Arc::new(HashExpr::new(
+        let hash_expr = Arc::new(HashExpr::new(
             vec![Arc::clone(&col_a)],
             SeededRandomState::with_seeds(1, 2, 3, 4),
             "inner_hash".to_string(),
@@ -589,14 +559,12 @@ mod tests {
 
         let expr1 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
-            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup_one".to_string(),
         );
 
         let expr2 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
-            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup_two".to_string(),
         );
@@ -607,7 +575,7 @@ mod tests {
     #[test]
     fn test_hash_table_lookup_expr_eq_different_hash_map() {
         let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
-        let hash_expr: PhysicalExprRef = Arc::new(HashExpr::new(
+        let hash_expr = Arc::new(HashExpr::new(
             vec![Arc::clone(&col_a)],
             SeededRandomState::with_seeds(1, 2, 3, 4),
             "inner_hash".to_string(),
@@ -620,14 +588,12 @@ mod tests {
             Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(10))));
         let expr1 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
-            vec![Arc::clone(&col_a)],
             hash_map1,
             "lookup".to_string(),
         );
 
         let expr2 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
-            vec![Arc::clone(&col_a)],
             hash_map2,
             "lookup".to_string(),
         );
@@ -639,7 +605,7 @@ mod tests {
     #[test]
     fn test_hash_table_lookup_expr_hash_consistency() {
         let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
-        let hash_expr: PhysicalExprRef = Arc::new(HashExpr::new(
+        let hash_expr = Arc::new(HashExpr::new(
             vec![Arc::clone(&col_a)],
             SeededRandomState::with_seeds(1, 2, 3, 4),
             "inner_hash".to_string(),
@@ -649,14 +615,12 @@ mod tests {
 
         let expr1 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
-            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );
 
         let expr2 = HashTableLookupExpr::new(
             Arc::clone(&hash_expr),
-            vec![Arc::clone(&col_a)],
             Arc::clone(&hash_map),
             "lookup".to_string(),
         );

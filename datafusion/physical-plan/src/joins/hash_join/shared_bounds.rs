@@ -133,11 +133,10 @@ fn create_membership_predicate(
                 on_right.to_vec(),
                 random_state.clone(),
                 "hash_join".to_string(),
-            )) as Arc<dyn PhysicalExpr>;
+            ));
 
             Ok(Some(Arc::new(HashTableLookupExpr::new(
                 lookup_hash_expr,
-                on_right.to_vec(),
                 hash_map,
                 "hash_lookup".to_string(),
             )) as Arc<dyn PhysicalExpr>))
