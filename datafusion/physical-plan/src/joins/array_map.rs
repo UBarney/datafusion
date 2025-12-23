@@ -30,7 +30,8 @@ use arrow::datatypes::{
 };
 use datafusion_common::{Result, internal_err};
 
-/// A "perfect" hash map for single-column integer join keys, represented as a dense array.
+/// TODO: 精简下这个 ai 味特别浓的注释
+///  A "perfect" map for single-column integer join keys, represented as a dense array.
 ///
 /// This structure is highly optimized for joins where the keys are integers within a limited
 /// range. Instead of calculating hashes, it uses the integer key itself as an index into a
@@ -53,7 +54,10 @@ pub struct ArrayMap {
     // data[probSideVal-offset] -> valIdxInBuildSide + 1; 0 for absent
     data: Vec<u32>,
     offset: u64, // min val in buildSide
-    next: Option<Vec<u32>>,
+    // next[buildSideIdx] -> next matching valIdxInBuildSide + 1; 0 for end of chain.
+    // If next is empty, it means there are no duplicate keys (no conflicts).
+    // It uses the same chain-based conflict resolution as JoinHashMapType.
+    next: Vec<u32>,
 }
 
 impl ArrayMap {
@@ -62,8 +66,6 @@ impl ArrayMap {
     /// Note: This function processes only the non-null values in the input `array`,
     /// effectively ignoring any rows where the key is `NULL`.
     ///
-    /// TODO: Support `NullEquality::NullEqualsNull` by storing null indices in a
-    /// separate `Vec` to allow for `NULL=NULL` matching in the future.
     pub(crate) fn try_new(
         array: &ArrayRef,
         offset_val: u64,
@@ -71,7 +73,7 @@ impl ArrayMap {
     ) -> Result<Self> {
         // Initialize with 0 (sentinel for not found)
         let mut data: Vec<u32> = vec![0; range];
-        let mut next: Option<Vec<u32>> = None;
+        let mut next: Vec<u32> = vec![];
 
         macro_rules! fill_data {
             ($ARR_TYPE:ty) => {{
@@ -79,17 +81,16 @@ impl ArrayMap {
                 for (i, val) in arr.iter().enumerate().rev() {
                     if let Some(val) = val {
                         let key = val as u64;
-                        // Calculate index: key - offset
                         let idx = key.wrapping_sub(offset_val) as usize;
                         if idx >= data.len() {
                             return internal_err!("failed build Array idx >= data.len()");
                         }
 
                         if data[idx] != 0 {
-                            if next.is_none() {
-                                next = Some(vec![0; array.len()])
+                            if next.is_empty() {
+                                next = vec![0; array.len()]
                             }
-                            next.as_mut().unwrap()[i] = data[idx]
+                            next[i] = data[idx]
                         }
                         data[idx] = (i) as u32 + 1;
                     }
@@ -221,94 +222,92 @@ impl ArrayMap {
 
         let have_null = arr.null_count() > 0;
 
-        match &self.next {
-            None => {
-                for prob_idx in current_offset.0..arr.len() {
-                    if build_indices.len() == limit {
-                        return Ok(Some((prob_idx, None)));
-                    }
-
-                    // short circuit
-                    if have_null && arr.is_null(prob_idx) {
-                        continue;
-                    }
-                    // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
-                    let prob_val = unsafe { arr.value_unchecked(prob_idx) }.as_();
-                    let idx_in_build_side = (prob_val.wrapping_sub(self.offset)) as usize;
-
-                    if idx_in_build_side >= self.data.len()
-                        || self.data[idx_in_build_side] == 0
-                    {
-                        continue;
-                    }
-                    build_indices.push((self.data[idx_in_build_side] - 1) as u64);
-                    probe_indices.push(prob_idx as u32);
+        if self.next.is_empty() {
+            for prob_idx in current_offset.0..arr.len() {
+                if build_indices.len() == limit {
+                    return Ok(Some((prob_idx, None)));
                 }
-                Ok(None)
+
+                // short circuit
+                if have_null && arr.is_null(prob_idx) {
+                    continue;
+                }
+                // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
+                let prob_val = unsafe { arr.value_unchecked(prob_idx) }.as_();
+                let idx_in_build_side = (prob_val.wrapping_sub(self.offset)) as usize;
+
+                if idx_in_build_side >= self.data.len()
+                    || self.data[idx_in_build_side] == 0
+                {
+                    continue;
+                }
+                build_indices.push((self.data[idx_in_build_side] - 1) as u64);
+                probe_indices.push(prob_idx as u32);
             }
-            Some(next) => {
-                let mut remaining_output = limit;
-                let to_skip = match current_offset {
-                    // None `initial_next_idx` indicates that `initial_idx` processing hasn't been started
-                    (idx, None) => idx,
-                    // Zero `initial_next_idx` indicates that `initial_idx` has been processed during
-                    // previous iteration, and it should be skipped
-                    (idx, Some(0)) => idx + 1,
-                    // Otherwise, process remaining `initial_idx` matches by traversing `next_chain`,
-                    // to start with the next index
-                    (idx, Some(next_idx)) => {
-                        let is_last = idx == arr.len() - 1;
-                        if let Some(next_offset) = traverse_chain(
-                            next,
-                            idx,
-                            next_idx as u32,
-                            &mut remaining_output,
-                            probe_indices,
-                            build_indices,
-                            is_last,
-                        ) {
-                            return Ok(Some(next_offset));
-                        }
-                        idx + 1
-                    }
-                };
-
-                for prob_side_idx in to_skip..arr.len() {
-                    if remaining_output == 0 {
-                        return Ok(Some((prob_side_idx, None)));
-                    }
-
-                    if arr.is_null(prob_side_idx) {
-                        continue;
-                    }
-
-                    let is_last = prob_side_idx == arr.len() - 1;
-
-                    let prob_val = unsafe { arr.value_unchecked(prob_side_idx) }.as_();
-                    // todo extract to func
-                    let idx_in_build_side = (prob_val.wrapping_sub(self.offset)) as usize;
-                    if idx_in_build_side >= self.data.len()
-                        || self.data[idx_in_build_side] == 0
-                    {
-                        continue;
-                    }
-
-                    let build_idx = self.data[idx_in_build_side];
-
-                    if let Some(offset) = traverse_chain(
-                        next,
-                        prob_side_idx,
-                        build_idx, // Pass u32 directly
+            Ok(None)
+        } else {
+            let mut remaining_output = limit;
+            let to_skip = match current_offset {
+                // None `initial_next_idx` indicates that `initial_idx` processing hasn't been started
+                (idx, None) => idx,
+                // Zero `initial_next_idx` indicates that `initial_idx` has been processed during
+                // previous iteration, and it should be skipped
+                (idx, Some(0)) => idx + 1,
+                // Otherwise, process remaining `initial_idx` matches by traversing `next_chain`,
+                // to start with the next index
+                (idx, Some(next_idx)) => {
+                    let is_last = idx == arr.len() - 1;
+                    if let Some(next_offset) = traverse_chain(
+                        &self.next,
+                        idx,
+                        next_idx as u32,
                         &mut remaining_output,
                         probe_indices,
                         build_indices,
                         is_last,
                     ) {
-                        return Ok(Some(offset));
+                        return Ok(Some(next_offset));
                     }
+                    idx + 1
                 }
-                Ok(None)
+            };
+
+            for prob_side_idx in to_skip..arr.len() {
+                if remaining_output == 0 {
+                    return Ok(Some((prob_side_idx, None)));
+                }
+
+                if arr.is_null(prob_side_idx) {
+                    continue;
+                }
+
+                let is_last = prob_side_idx == arr.len() - 1;
+
+                // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
+                let prob_val = unsafe { arr.value_unchecked(prob_side_idx) }.as_();
+                // todo extract to func
+                let idx_in_build_side = (prob_val.wrapping_sub(self.offset)) as usize;
+                if idx_in_build_side >= self.data.len()
+                    || self.data[idx_in_build_side] == 0
+                {
+                    continue;
+                }
+
+                let build_idx = self.data[idx_in_build_side];
+
+                if let Some(offset) = traverse_chain(
+                    &self.next,
+                    prob_side_idx,
+                    build_idx,
+                    &mut remaining_output,
+                    probe_indices,
+                    build_indices,
+                    is_last,
+                ) {
+                    return Ok(Some(offset));
+                }
             }
+            Ok(None)
         }
     }
 

@@ -205,8 +205,8 @@ pub(super) struct HashJoinStream {
     build_side: BuildSide,
     /// Maximum output batch size
     batch_size: usize,
-    /// Scratch space for prob side
-    prob_side_buffer: Vec<u64>,
+    /// Scratch space for computing hashes
+    hashes_buffer: Vec<u64>,
     /// Scratch space for probe indices during hash lookup
     probe_indices_buffer: Vec<u32>,
     /// Scratch space for build indices during hash lookup
@@ -394,7 +394,7 @@ impl HashJoinStream {
             state,
             build_side,
             batch_size,
-            prob_side_buffer: hashes_buffer,
+            hashes_buffer,
             probe_indices_buffer: Vec::with_capacity(batch_size),
             build_indices_buffer: Vec::with_capacity(batch_size),
             right_side_ordered,
@@ -554,12 +554,12 @@ impl HashJoinStream {
                 let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
 
                 if let Map::HashMap(_) = self.build_side.try_as_ready()?.left_data.map() {
-                    self.prob_side_buffer.clear();
-                    self.prob_side_buffer.resize(batch.num_rows(), 0);
+                    self.hashes_buffer.clear();
+                    self.hashes_buffer.resize(batch.num_rows(), 0);
                     create_hashes(
                         &keys_values,
                         &self.random_state,
-                        &mut self.prob_side_buffer,
+                        &mut self.hashes_buffer,
                     )?;
                 }
 
@@ -621,7 +621,7 @@ impl HashJoinStream {
                 build_side.left_data.values(),
                 &state.values,
                 self.null_equality,
-                &self.prob_side_buffer,
+                &self.hashes_buffer,
                 self.batch_size,
                 state.offset,
                 &mut self.probe_indices_buffer,
