@@ -60,7 +60,7 @@ impl fmt::Debug for Map {
             Map::HashMap(_) => write!(f, "JoinHashMap::HashMap(...)"),
             Map::ArrayMap(array_map) => f
                 .debug_struct("JoinHashMap::ArrayKV")
-                .field("data_len", &array_map.data_len())
+                .field("num_of_distinct_key", &array_map.num_of_distinct_key())
                 .field("offset", &array_map.offset())
                 .finish(),
         }
@@ -69,16 +69,16 @@ impl fmt::Debug for Map {
 
 impl Map {
     /// Returns the number of elements in the map.
-    pub fn len(&self) -> usize {
+    pub fn num_of_distinct_key(&self) -> usize {
         match self {
             Map::HashMap(map) => map.len(),
-            Map::ArrayMap(array_map) => array_map.data_len(),
+            Map::ArrayMap(array_map) => array_map.num_of_distinct_key(),
         }
     }
 
     /// Returns `true` if the map contains no elements.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.num_of_distinct_key() == 0
     }
 }
 

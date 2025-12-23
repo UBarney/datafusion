@@ -1656,7 +1656,7 @@ async fn collect_left_input(
         if left_values.is_empty()
             || left_values[0].is_empty()
             || estimated_size > config.optimizer.hash_join_inlist_pushdown_max_size
-            || join_hash_map.len()
+            || join_hash_map.num_of_distinct_key()
                 > config
                     .optimizer
                     .hash_join_inlist_pushdown_max_distinct_values

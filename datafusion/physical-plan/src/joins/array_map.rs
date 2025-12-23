@@ -56,6 +56,7 @@ pub struct ArrayMap {
     // If next is empty, it means there are no duplicate keys (no conflicts).
     // It uses the same chain-based conflict resolution as JoinHashMapType.
     next: Vec<u32>,
+    num_of_distinct_key: usize,
 }
 
 impl ArrayMap {
@@ -72,6 +73,7 @@ impl ArrayMap {
         // Initialize with 0 (sentinel for not found)
         let mut data: Vec<u32> = vec![0; range];
         let mut next: Vec<u32> = vec![];
+        let mut num_of_distinct_key = 0;
 
         macro_rules! fill_data {
             ($ARR_TYPE:ty) => {{
@@ -89,6 +91,8 @@ impl ArrayMap {
                                 next = vec![0; array.len()]
                             }
                             next[i] = data[idx]
+                        } else {
+                            num_of_distinct_key += 1;
                         }
                         data[idx] = (i) as u32 + 1;
                     }
@@ -117,11 +121,12 @@ impl ArrayMap {
             data,
             offset: offset_val,
             next,
+            num_of_distinct_key,
         })
     }
 
-    pub fn data_len(&self) -> usize {
-        self.data.len()
+    pub fn num_of_distinct_key(&self) -> usize {
+        self.num_of_distinct_key
     }
 
     pub fn offset(&self) -> u64 {
