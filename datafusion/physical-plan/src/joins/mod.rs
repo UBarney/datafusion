@@ -43,8 +43,44 @@ mod join_filter;
 /// Note: This module is public for internal testing purposes only
 /// and is not guaranteed to be stable across versions.
 pub mod join_hash_map;
-pub use array_map::Map;
 mod array_map;
+
+use array_map::ArrayMap;
+use std::fmt;
+use utils::JoinHashMapType;
+
+pub enum Map {
+    HashMap(Box<dyn JoinHashMapType>),
+    ArrayMap(ArrayMap),
+}
+
+impl fmt::Debug for Map {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Map::HashMap(_) => write!(f, "JoinHashMap::HashMap(...)"),
+            Map::ArrayMap(array_map) => f
+                .debug_struct("JoinHashMap::ArrayKV")
+                .field("data_len", &array_map.data_len())
+                .field("offset", &array_map.offset())
+                .finish(),
+        }
+    }
+}
+
+impl Map {
+    /// Returns the number of elements in the map.
+    pub fn len(&self) -> usize {
+        match self {
+            Map::HashMap(map) => map.len(),
+            Map::ArrayMap(array_map) => array_map.data_len(),
+        }
+    }
+
+    /// Returns `true` if the map contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 #[cfg(test)]
 pub mod test_utils;

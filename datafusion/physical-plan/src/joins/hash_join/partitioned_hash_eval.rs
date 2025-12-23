@@ -33,7 +33,7 @@ use datafusion_physical_expr_common::{
     utils::evaluate_expressions_to_arrays,
 };
 
-use crate::{hash_utils::create_hashes, joins::array_map::Map};
+use crate::{hash_utils::create_hashes, joins::Map};
 
 /// RandomState wrapper that preserves the seeds used to create it.
 ///

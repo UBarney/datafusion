@@ -17,11 +17,9 @@
 
 use arrow::buffer::MutableBuffer;
 use num_traits::AsPrimitive;
-use std::fmt;
 
 use crate::joins::chain::traverse_chain;
 use crate::joins::join_hash_map::JoinHashMapOffset;
-use crate::joins::utils::JoinHashMapType;
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::DataType;
 use arrow::datatypes::{
@@ -120,6 +118,14 @@ impl ArrayMap {
             offset: offset_val,
             next,
         })
+    }
+
+    pub fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
     }
 
     pub fn get_matched_indices_with_limit_offset(
@@ -356,39 +362,6 @@ impl ArrayMap {
             }
         }
         Ok(())
-    }
-}
-
-pub enum Map {
-    HashMap(Box<dyn JoinHashMapType>),
-    ArrayMap(ArrayMap),
-}
-
-impl fmt::Debug for Map {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Map::HashMap(_) => write!(f, "JoinHashMap::HashMap(...)"),
-            Map::ArrayMap(array_map) => f
-                .debug_struct("JoinHashMap::ArrayKV")
-                .field("data_len", &array_map.data.len())
-                .field("offset", &array_map.offset)
-                .finish(),
-        }
-    }
-}
-
-impl Map {
-    /// Returns the number of elements in the map.
-    pub fn len(&self) -> usize {
-        match self {
-            Map::HashMap(map) => map.len(),
-            Map::ArrayMap(array_map) => array_map.data.len(),
-        }
-    }
-
-    /// Returns `true` if the map contains no elements.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
