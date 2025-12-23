@@ -1718,9 +1718,9 @@ mod tests {
         a.div_ceil(b)
     }
 
-    #[template]
-    #[rstest]
-    fn batch_sizes(#[values(8192, 10, 5, 2, 1)] batch_size: usize) {}
+    // #[template]
+    // #[rstest]
+    // fn batch_sizes(#[values(8192, 10, 5, 2, 1)] batch_size: usize) {}
 
     #[template]
     #[rstest]

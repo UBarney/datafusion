@@ -21,32 +21,43 @@ use num_traits::AsPrimitive;
 use crate::joins::chain::traverse_chain;
 use crate::joins::join_hash_map::JoinHashMapOffset;
 use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::datatypes::DataType;
-use arrow::datatypes::{
-    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type,
-    UInt64Type,
-};
+use arrow::datatypes::ArrowNumericType;
 use datafusion_common::{Result, internal_err};
 
-/// TODO: 精简下这个 ai 味特别浓的注释
-///  A "perfect" map for single-column integer join keys, represented as a dense array.
+/// A macro to downcast only supported integer types (up to 64-bit) and invoke a generic function.
 ///
-/// This structure is highly optimized for joins where the keys are integers within a limited
-/// range. Instead of calculating hashes, it uses the integer key itself as an index into a
-/// `Vec`, achieving O(1) lookup performance.
+/// Usage: `downcast_supported_integer!(data_type => (Method, arg1, arg2, ...))`
+///
+/// The `Method` must be an associated method of [`ArrayMap`] that is generic over
+/// `<T: ArrowNumericType>` and allow `T::Native: AsPrimitive<u64>`.
+macro_rules! downcast_supported_integer {
+    ($DATA_TYPE:expr => ($METHOD:ident $(, $ARGS:expr)*)) => {
+        match $DATA_TYPE {
+            arrow::datatypes::DataType::Int8 => ArrayMap::$METHOD::<arrow::datatypes::Int8Type>($($ARGS),*),
+            arrow::datatypes::DataType::Int16 => ArrayMap::$METHOD::<arrow::datatypes::Int16Type>($($ARGS),*),
+            arrow::datatypes::DataType::Int32 => ArrayMap::$METHOD::<arrow::datatypes::Int32Type>($($ARGS),*),
+            arrow::datatypes::DataType::Int64 => ArrayMap::$METHOD::<arrow::datatypes::Int64Type>($($ARGS),*),
+            arrow::datatypes::DataType::UInt8 => ArrayMap::$METHOD::<arrow::datatypes::UInt8Type>($($ARGS),*),
+            arrow::datatypes::DataType::UInt16 => ArrayMap::$METHOD::<arrow::datatypes::UInt16Type>($($ARGS),*),
+            arrow::datatypes::DataType::UInt32 => ArrayMap::$METHOD::<arrow::datatypes::UInt32Type>($($ARGS),*),
+            arrow::datatypes::DataType::UInt64 => ArrayMap::$METHOD::<arrow::datatypes::UInt64Type>($($ARGS),*),
+            _ => {
+                return internal_err!(
+                    "Unsupported type for ArrayMap: {:?}",
+                    $DATA_TYPE
+                );
+            }
+        }
+    };
+}
+
+/// A dense map for single-column integer join keys within a limited range.
+///
+/// Uses integer keys directly as indices into a `Vec` for O(1) lookups without hashing.
 ///
 /// # NULL Handling
-///
-/// This optimization can be used for joins with `NullEquality::NullEqualsNothing` even if the
-/// join keys contain `NULL`s. This is because:
-///
-/// 1. `try_new` (build side): Ignores rows with `NULL` keys when creating the map. This is
-///    correct as `NULL` keys would not match anything anyway.
-/// 2. `get_matched_indices_with_limit_offset` (probe side): Skips any `NULL` keys encountered
-///    in the probe side input.
-///
-/// This structure **cannot** be used for joins with `NullEquality::NullEqualsNull` if the
-/// build side contains `NULL`s, as it does not have a mechanism to store and match `NULL` values.
+/// - `NullEquality::NullEqualsNothing`: Supported; NULLs are ignored on both sides.
+/// - `NullEquality::NullEqualsNull`: **Not supported** if the build side contains NULLs.
 #[derive(Debug)]
 pub struct ArrayMap {
     // data[probSideVal-offset] -> valIdxInBuildSide + 1; 0 for absent
@@ -75,47 +86,16 @@ impl ArrayMap {
         let mut next: Vec<u32> = vec![];
         let mut num_of_distinct_key = 0;
 
-        macro_rules! fill_data {
-            ($ARR_TYPE:ty) => {{
-                let arr = array.as_primitive::<$ARR_TYPE>();
-                for (i, val) in arr.iter().enumerate().rev() {
-                    if let Some(val) = val {
-                        let key = val as u64;
-                        let idx = key.wrapping_sub(offset_val) as usize;
-                        if idx >= data.len() {
-                            return internal_err!("failed build Array idx >= data.len()");
-                        }
-
-                        if data[idx] != 0 {
-                            if next.is_empty() {
-                                next = vec![0; array.len()]
-                            }
-                            next[i] = data[idx]
-                        } else {
-                            num_of_distinct_key += 1;
-                        }
-                        data[idx] = (i) as u32 + 1;
-                    }
-                }
-            }};
-        }
-
-        match array.data_type() {
-            DataType::Int8 => fill_data!(Int8Type),
-            DataType::Int16 => fill_data!(Int16Type),
-            DataType::Int32 => fill_data!(Int32Type),
-            DataType::Int64 => fill_data!(Int64Type),
-            DataType::UInt8 => fill_data!(UInt8Type),
-            DataType::UInt16 => fill_data!(UInt16Type),
-            DataType::UInt32 => fill_data!(UInt32Type),
-            DataType::UInt64 => fill_data!(UInt64Type),
-            _ => {
-                return internal_err!(
-                    "Unsupported type for perfect hash join conversion: {:?}",
-                    array.data_type()
-                );
-            }
-        }
+        downcast_supported_integer!(
+            array.data_type() => (
+                fill_data,
+                array,
+                offset_val,
+                &mut data,
+                &mut next,
+                &mut num_of_distinct_key
+            )
+        )?;
 
         Ok(Self {
             data,
@@ -123,6 +103,39 @@ impl ArrayMap {
             next,
             num_of_distinct_key,
         })
+    }
+
+    fn fill_data<T: ArrowNumericType>(
+        array: &ArrayRef,
+        offset_val: u64,
+        data: &mut [u32],
+        next: &mut Vec<u32>,
+        num_of_distinct_key: &mut usize,
+    ) -> Result<()>
+    where
+        T::Native: AsPrimitive<u64>,
+    {
+        let arr = array.as_primitive::<T>();
+        for (i, val) in arr.iter().enumerate().rev() {
+            if let Some(val) = val {
+                let key: u64 = val.as_();
+                let idx = key.wrapping_sub(offset_val) as usize;
+                if idx >= data.len() {
+                    return internal_err!("failed build Array idx >= data.len()");
+                }
+
+                if data[idx] != 0 {
+                    if next.is_empty() {
+                        *next = vec![0; array.len()]
+                    }
+                    next[i] = data[idx]
+                } else {
+                    *num_of_distinct_key += 1;
+                }
+                data[idx] = (i) as u32 + 1;
+            }
+        }
+        Ok(())
     }
 
     pub fn num_of_distinct_key(&self) -> usize {
@@ -149,73 +162,20 @@ impl ArrayMap {
         }
         let array = &prob_side_keys[0];
 
-        match array.data_type() {
-            DataType::Int8 => self.lookup_and_get_indices::<Int8Type>(
+        downcast_supported_integer!(
+            array.data_type() => (
+                lookup_and_get_indices,
+                self,
                 array,
                 limit,
                 current_offset,
                 probe_indices,
-                build_indices,
-            ),
-            DataType::Int16 => self.lookup_and_get_indices::<Int16Type>(
-                array,
-                limit,
-                current_offset,
-                probe_indices,
-                build_indices,
-            ),
-            DataType::Int32 => self.lookup_and_get_indices::<Int32Type>(
-                array,
-                limit,
-                current_offset,
-                probe_indices,
-                build_indices,
-            ),
-            DataType::Int64 => self.lookup_and_get_indices::<Int64Type>(
-                array,
-                limit,
-                current_offset,
-                probe_indices,
-                build_indices,
-            ),
-            DataType::UInt8 => self.lookup_and_get_indices::<UInt8Type>(
-                array,
-                limit,
-                current_offset,
-                probe_indices,
-                build_indices,
-            ),
-            DataType::UInt16 => self.lookup_and_get_indices::<UInt16Type>(
-                array,
-                limit,
-                current_offset,
-                probe_indices,
-                build_indices,
-            ),
-            DataType::UInt32 => self.lookup_and_get_indices::<UInt32Type>(
-                array,
-                limit,
-                current_offset,
-                probe_indices,
-                build_indices,
-            ),
-            DataType::UInt64 => self.lookup_and_get_indices::<UInt64Type>(
-                array,
-                limit,
-                current_offset,
-                probe_indices,
-                build_indices,
-            ),
-            _ => {
-                internal_err!(
-                    "Unsupported type for ArrayKV lookup: {:?}",
-                    array.data_type()
-                )
-            }
-        }
+                build_indices
+            )
+        )
     }
 
-    fn lookup_and_get_indices<T: arrow::datatypes::ArrowNumericType>(
+    fn lookup_and_get_indices<T: ArrowNumericType>(
         &self,
         array: &ArrayRef,
         limit: usize,
@@ -335,38 +295,34 @@ impl ArrayMap {
         }
         let array = &probe_side_keys[0];
 
-        macro_rules! fill_buffer {
-            ($T:ty) => {{
-                let arr = array.as_primitive::<$T>();
-                for (i, val) in arr.iter().enumerate() {
-                    if let Some(val) = val {
-                        let key: u64 = val.as_();
-                        let idx = (key.wrapping_sub(self.offset)) as usize;
-                        if idx < self.data.len() && self.data[idx] != 0 {
-                            arrow::util::bit_util::set_bit(buf.as_slice_mut(), i);
-                        }
-                    }
-                }
-            }};
-        }
+        downcast_supported_integer!(
+            array.data_type() => (
+                mark_existing_probes_helper,
+                self,
+                array,
+                buf
+            )
+        );
+        Ok(())
+    }
 
-        match array.data_type() {
-            DataType::Int8 => fill_buffer!(Int8Type),
-            DataType::Int16 => fill_buffer!(Int16Type),
-            DataType::Int32 => fill_buffer!(Int32Type),
-            DataType::Int64 => fill_buffer!(Int64Type),
-            DataType::UInt8 => fill_buffer!(UInt8Type),
-            DataType::UInt16 => fill_buffer!(UInt16Type),
-            DataType::UInt32 => fill_buffer!(UInt32Type),
-            DataType::UInt64 => fill_buffer!(UInt64Type),
-            _ => {
-                return internal_err!(
-                    "Unsupported type for ArrayMap lookup: {:?}",
-                    array.data_type()
-                );
+    fn mark_existing_probes_helper<T: ArrowNumericType>(
+        &self,
+        array: &ArrayRef,
+        buf: &mut MutableBuffer,
+    ) where
+        T::Native: AsPrimitive<u64>,
+    {
+        let arr = array.as_primitive::<T>();
+        for (i, val) in arr.iter().enumerate() {
+            if let Some(val) = val {
+                let key: u64 = val.as_();
+                let idx = (key.wrapping_sub(self.offset)) as usize;
+                if idx < self.data.len() && self.data[idx] != 0 {
+                    arrow::util::bit_util::set_bit(buf.as_slice_mut(), i);
+                }
             }
         }
-        Ok(())
     }
 }
 
