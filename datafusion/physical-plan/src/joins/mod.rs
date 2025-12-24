@@ -46,7 +46,6 @@ pub mod join_hash_map;
 mod array_map;
 
 use array_map::ArrayMap;
-use std::fmt;
 use utils::JoinHashMapType;
 
 pub enum Map {
@@ -54,18 +53,6 @@ pub enum Map {
     ArrayMap(ArrayMap),
 }
 
-impl fmt::Debug for Map {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Map::HashMap(_) => write!(f, "JoinHashMap::HashMap(...)"),
-            Map::ArrayMap(array_map) => f
-                .debug_struct("JoinHashMap::ArrayKV")
-                .field("num_of_distinct_key", &array_map.num_of_distinct_key())
-                .field("offset", &array_map.offset())
-                .finish(),
-        }
-    }
-}
 
 impl Map {
     /// Returns the number of elements in the map.

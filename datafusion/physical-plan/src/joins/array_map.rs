@@ -62,10 +62,11 @@ macro_rules! downcast_supported_integer {
 pub struct ArrayMap {
     // data[probSideVal-offset] -> valIdxInBuildSide + 1; 0 for absent
     data: Vec<u32>,
-    offset: u64, // min val in buildSide
+    // min val in buildSide
+    offset: u64,
     // next[buildSideIdx] -> next matching valIdxInBuildSide + 1; 0 for end of chain.
     // If next is empty, it means there are no duplicate keys (no conflicts).
-    // It uses the same chain-based conflict resolution as JoinHashMapType.
+    // It uses the same chain-based conflict resolution as [`JoinHashMapType`].
     next: Vec<u32>,
     num_of_distinct_key: usize,
 }
@@ -74,14 +75,13 @@ impl ArrayMap {
     /// Creates a new [`ArrayKV`] from the given array of join keys.
     ///
     /// Note: This function processes only the non-null values in the input `array`,
-    /// effectively ignoring any rows where the key is `NULL`.
+    /// ignoring any rows where the key is `NULL`.
     ///
     pub(crate) fn try_new(
         array: &ArrayRef,
         offset_val: u64,
         range: usize,
     ) -> Result<Self> {
-        // Initialize with 0 (sentinel for not found)
         let mut data: Vec<u32> = vec![0; range];
         let mut next: Vec<u32> = vec![];
         let mut num_of_distinct_key = 0;
@@ -116,6 +116,7 @@ impl ArrayMap {
         T::Native: AsPrimitive<u64>,
     {
         let arr = array.as_primitive::<T>();
+        // Iterate in reverse to maintain FIFO order when there are duplicate keys.
         for (i, val) in arr.iter().enumerate().rev() {
             if let Some(val) = val {
                 let key: u64 = val.as_();
@@ -140,10 +141,6 @@ impl ArrayMap {
 
     pub fn num_of_distinct_key(&self) -> usize {
         self.num_of_distinct_key
-    }
-
-    pub fn offset(&self) -> u64 {
-        self.offset
     }
 
     pub fn get_matched_indices_with_limit_offset(
