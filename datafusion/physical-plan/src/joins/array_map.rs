@@ -143,6 +143,11 @@ impl ArrayMap {
         self.num_of_distinct_key
     }
 
+    /// Returns the memory usage of this [`ArrayMap`] in bytes.
+    pub fn size(&self) -> usize {
+        self.data.capacity() * size_of::<u32>() + self.next.capacity() * size_of::<u32>()
+    }
+
     pub fn get_matched_indices_with_limit_offset(
         &self,
         prob_side_keys: &[ArrayRef],

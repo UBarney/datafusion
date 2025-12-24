@@ -27,8 +27,8 @@ use crate::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation,
 };
-use crate::joins::array_map::ArrayMap;
 use crate::joins::Map;
+use crate::joins::array_map::ArrayMap;
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::shared_bounds::{
     ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
@@ -104,7 +104,6 @@ fn try_create_array_map(
     batches: &[RecordBatch],
     on_left: &[PhysicalExprRef],
     reservation: &mut MemoryReservation,
-    metrics: &BuildProbeJoinMetrics,
     perfect_hash_join_small_build_threshold: usize,
     perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
@@ -122,12 +121,13 @@ fn try_create_array_map(
         }
     }
 
-    let min_max = bounds
-        .as_ref()
-        .and_then(|x| x.get_column_bounds(0))
-        .map(|cb| (cb.min.clone(), cb.max.clone()));
+    let (min_val, max_val) = if let Some(bounds) = bounds {
+        let (min_val, max_val) = if let Some(cb) = bounds.get_column_bounds(0) {
+            (cb.min.clone(), cb.max.clone())
+        } else {
+            return Ok(None);
+        };
 
-    let (min_val, max_val) = if let Some((min_val, max_val)) = min_max {
         if min_val.is_null() || max_val.is_null() {
             return Ok(None);
         }
@@ -187,8 +187,6 @@ fn try_create_array_map(
 
     let array_map = ArrayMap::try_new(&left_values[0], offset_val, size)?;
 
-    // TODO: move to caller ?
-    metrics.build_mem_used.add(mem_size);
     Ok(Some((array_map, batch, left_values)))
 }
 
@@ -1430,10 +1428,6 @@ impl BuildSideState {
     }
 }
 
-/// Check if we should collect min/max bounds for perfect hash optimization.
-/// Returns true if:
-/// 1. Single column join
-/// 2. Column is integer type (supports perfect hash)
 fn should_collect_min_max_for_perfect_hash(
     on_left: &[PhysicalExprRef],
     schema: &SchemaRef,
@@ -1442,7 +1436,6 @@ fn should_collect_min_max_for_perfect_hash(
         return Ok(false);
     }
 
-    // Condition 2: must be integer type (supports perfect hash)
     let expr = &on_left[0];
     let data_type = expr.data_type(schema)?;
     Ok(matches!(
@@ -1504,9 +1497,7 @@ async fn collect_left_input(
 
     let should_collect_for_perfect_hash =
         should_collect_min_max_for_perfect_hash(&on_left, &schema)?;
-    // This operation performs 2 steps at once:
-    // 1. creates a [JoinHashMap] of all batches from the stream
-    // 2. stores the batches in a vector.
+
     let initial = BuildSideState::try_new(
         metrics,
         reservation,
@@ -1549,9 +1540,7 @@ async fn collect_left_input(
         bounds_accumulators,
     } = state;
 
-    let batches_iter = batches.iter().rev();
-
-    // Compute bounds for dynamic filter if enabled
+    // Compute bounds
     let bounds = match bounds_accumulators {
         Some(accumulators) if num_rows > 0 => {
             let bounds = accumulators
@@ -1570,12 +1559,13 @@ async fn collect_left_input(
             &batches,
             &on_left,
             &mut reservation,
-            &metrics,
             config.execution.perfect_hash_join_small_build_threshold,
             config.execution.perfect_hash_join_min_key_density,
             null_equality,
         )? {
             array_map_created_count.add(1);
+            metrics.build_mem_used.add(array_map.size());
+
             (Map::ArrayMap(array_map), batch, left_value)
         } else {
             // Estimation of memory size, required for hashtable, prior to allocation.
@@ -1602,6 +1592,8 @@ async fn collect_left_input(
 
             let mut hashes_buffer = Vec::new();
             let mut offset = 0;
+
+            let batches_iter = batches.iter().rev();
 
             // Updating hashmap starting from the last batch
             for batch in batches_iter.clone() {
@@ -1640,8 +1632,7 @@ async fn collect_left_input(
         BooleanBufferBuilder::new(0)
     };
 
-    // Convert Box to Arc for sharing with SharedBuildAccumulator
-    let join_hash_map = Arc::new(join_hash_map);
+    let map = Arc::new(join_hash_map);
 
     let membership = if num_rows == 0 {
         PushdownStrategy::Empty
@@ -1656,21 +1647,21 @@ async fn collect_left_input(
         if left_values.is_empty()
             || left_values[0].is_empty()
             || estimated_size > config.optimizer.hash_join_inlist_pushdown_max_size
-            || join_hash_map.num_of_distinct_key()
+            || map.num_of_distinct_key()
                 > config
                     .optimizer
                     .hash_join_inlist_pushdown_max_distinct_values
         {
-            PushdownStrategy::HashTable(Arc::clone(&join_hash_map))
+            PushdownStrategy::HashTable(Arc::clone(&map))
         } else if let Some(in_list_values) = build_struct_inlist_values(&left_values)? {
             PushdownStrategy::InList(in_list_values)
         } else {
-            PushdownStrategy::HashTable(Arc::clone(&join_hash_map))
+            PushdownStrategy::HashTable(Arc::clone(&map))
         }
     };
 
     let data = JoinLeftData {
-        map: join_hash_map,
+        map,
         batch,
         values: left_values,
         visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
