@@ -132,21 +132,25 @@ fn try_create_array_map(
             return Ok(None);
         }
 
-        let to_i128 = |v: &ScalarValue| -> Option<i128> {
+        if min_val > max_val {
+            return internal_err!("min_val>max_val");
+        }
+
+        let to_u64 = |v: &ScalarValue| -> Option<u64> {
             match v {
-                ScalarValue::Int8(Some(v)) => Some(*v as i128),
-                ScalarValue::Int16(Some(v)) => Some(*v as i128),
-                ScalarValue::Int32(Some(v)) => Some(*v as i128),
-                ScalarValue::Int64(Some(v)) => Some(*v as i128),
-                ScalarValue::UInt8(Some(v)) => Some(*v as i128),
-                ScalarValue::UInt16(Some(v)) => Some(*v as i128),
-                ScalarValue::UInt32(Some(v)) => Some(*v as i128),
-                ScalarValue::UInt64(Some(v)) => Some(*v as i128),
+                ScalarValue::Int8(Some(v)) => Some(*v as u64),
+                ScalarValue::Int16(Some(v)) => Some(*v as u64),
+                ScalarValue::Int32(Some(v)) => Some(*v as u64),
+                ScalarValue::Int64(Some(v)) => Some(*v as u64),
+                ScalarValue::UInt8(Some(v)) => Some(*v as u64),
+                ScalarValue::UInt16(Some(v)) => Some(*v as u64),
+                ScalarValue::UInt32(Some(v)) => Some(*v as u64),
+                ScalarValue::UInt64(Some(v)) => Some(*v as u64),
                 _ => None,
             }
         };
 
-        if let Some((mi, ma)) = to_i128(&min_val).zip(to_i128(&max_val)) {
+        if let Some((mi, ma)) = to_u64(&min_val).zip(to_u64(&max_val)) {
             (mi, ma)
         } else {
             return Ok(None);
@@ -155,11 +159,7 @@ fn try_create_array_map(
         return Ok(None);
     };
 
-    if min_val > max_val {
-        return internal_err!("min_val>max_val");
-    }
-
-    let range = max_val - min_val;
+    let range = ArrayMap::calculate_range(min_val, max_val);
     let num_row: usize = batches.iter().map(|x| x.num_rows()).sum();
     let dense_ratio = (num_row as f64) / ((range + 1) as f64);
 
@@ -168,21 +168,21 @@ fn try_create_array_map(
         return Ok(None);
     }
 
-    if range > perfect_hash_join_small_build_threshold as i128
+    if range > perfect_hash_join_small_build_threshold as u64
         && dense_ratio < perfect_hash_join_min_key_density
     {
         return Ok(None);
     }
 
     let mem_size =
-        ArrayMap::estimate_memory_size(min_val as u64, max_val as u64, num_row);
+        ArrayMap::estimate_memory_size(min_val, max_val, num_row);
     reservation.try_grow(mem_size)?;
 
     let batch = concat_batches(schema, batches)?;
     let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
     let array_map =
-        ArrayMap::try_new(&left_values[0], min_val as u64, max_val as u64)?;
+        ArrayMap::try_new(&left_values[0], min_val, max_val)?;
 
     Ok(Some((array_map, batch, left_values)))
 }

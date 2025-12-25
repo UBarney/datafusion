@@ -122,14 +122,14 @@ impl ArrayMap {
     /// This represents the largest possible memory footprint, as the `next`
     /// buffer is only allocated if there are duplicate keys. By estimating for
     /// the worst-case, we ensure sufficient memory is reserved.
-    pub fn estimate_memory_size(
-        min_val: u64,
-        max_val: u64,
-        num_rows: usize,
-    ) -> usize {
-        let range = max_val.wrapping_sub(min_val);
+    pub fn estimate_memory_size(min_val: u64, max_val: u64, num_rows: usize) -> usize {
+        let range = Self::calculate_range(min_val, max_val);
         let size = (range + 1) as usize;
         size * size_of::<u32>() + num_rows * size_of::<u32>()
+    }
+
+    pub fn calculate_range(min_val: u64, max_val: u64) -> u64 {
+        max_val.wrapping_sub(min_val)
     }
 
     /// Creates a new [`ArrayMap`] from the given array of join keys.
@@ -145,11 +145,7 @@ impl ArrayMap {
     /// Note: This function processes only the non-null values in the input `array`,
     /// ignoring any rows where the key is `NULL`.
     ///
-    pub(crate) fn try_new(
-        array: &ArrayRef,
-        min_val: u64,
-        max_val: u64,
-    ) -> Result<Self> {
+    pub(crate) fn try_new(array: &ArrayRef, min_val: u64, max_val: u64) -> Result<Self> {
         let range = max_val.wrapping_sub(min_val);
         let size = (range + 1) as usize;
 
@@ -328,8 +324,7 @@ impl ArrayMap {
                 let is_last = prob_side_idx == arr.len() - 1;
 
                 // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
-                let prob_val: u64 =
-                    unsafe { arr.value_unchecked(prob_side_idx) }.as_();
+                let prob_val: u64 = unsafe { arr.value_unchecked(prob_side_idx) }.as_();
                 // todo extract to func
                 let idx_in_build_side = prob_val.wrapping_sub(self.offset) as usize;
                 if idx_in_build_side >= self.data.len()
@@ -570,16 +565,14 @@ mod tests {
     #[test]
     fn test_array_map_i64_with_negative_and_positive_numbers() -> Result<()> {
         // Build array with a mix of negative and positive i64 values, no duplicates
-        let build_array: ArrayRef =
-            Arc::new(Int64Array::from(vec![-5, 0, 5, -2, 3, 10]));
+        let build_array: ArrayRef = Arc::new(Int64Array::from(vec![-5, 0, 5, -2, 3, 10]));
         let min_val = -5_i128;
         let max_val = 10_i128;
 
         let array_map = ArrayMap::try_new(&build_array, min_val as u64, max_val as u64)?;
 
         // Probe array
-        let probe_array: ArrayRef =
-            Arc::new(Int64Array::from(vec![0, -5, 10, -1]));
+        let probe_array: ArrayRef = Arc::new(Int64Array::from(vec![0, -5, 10, -1]));
         let prob_side_keys = [probe_array.clone()];
 
         let mut prob_indices = Vec::new();
