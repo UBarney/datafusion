@@ -17,6 +17,7 @@
 
 use arrow::buffer::MutableBuffer;
 use num_traits::AsPrimitive;
+use std::mem::size_of;
 
 use crate::joins::chain::traverse_chain;
 use crate::joins::join_hash_map::JoinHashMapOffset;
@@ -58,6 +59,46 @@ macro_rules! downcast_supported_integer {
 /// # NULL Handling
 /// - `NullEquality::NullEqualsNothing`: Supported; NULLs are ignored on both sides.
 /// - `NullEquality::NullEqualsNull`: **Not supported** if the build side contains NULLs.
+///
+/// # Handling Negative Numbers with `wrapping_sub`
+///
+/// This implementation supports signed integer ranges (e.g., `[-5, 5]`) efficiently by
+/// treating them as `u64` (Two's Complement) and relying on the bitwise properties of
+/// wrapping arithmetic (`wrapping_sub`).
+///
+/// In Two's Complement representation, `a_signed - b_signed` produces the same bit pattern
+/// as `a_unsigned.wrapping_sub(b_unsigned)` (modulo 2^N). This allows us to perform
+/// range calculations and zero-based index mapping uniformly for both signed and unsigned
+/// types without branching.
+///
+/// ## Examples
+///
+/// Consider an `Int64` range `[-5, 5]`.
+/// * `min_val (-5)` casts to `u64`: `...11111011` (`u64::MAX - 4`)
+/// * `max_val (5)` casts to `u64`: `...00000101` (`5`)
+///
+/// **1. Range Calculation (in `try_new`)**
+///
+/// ```text
+/// In modular arithmetic, this is equivalent to:
+///   (5 - (2^64 - 5)) mod 2^64
+/// = (5 - 2^64 + 5) mod 2^64
+/// = (10 - 2^64) mod 2^64
+/// = 10
+///
+/// ```
+/// The resulting `range` (10) correctly represents the size of the interval `[-5, 5]`.
+///
+/// **2. Index Lookup (in `get_matched_indices`)**
+///
+/// For a probe value of `0` (which is stored as `0u64`):
+/// ```text
+/// In modular arithmetic, this is equivalent to:
+///   (0 - (2^64 - 5)) mod 2^64
+/// = (-2^64 + 5) mod 2^64
+/// = 5
+/// ```
+/// This correctly maps `-5` to index `0`, `0` to index `5`, etc.
 #[derive(Debug)]
 pub struct ArrayMap {
     // data[probSideVal-offset] -> valIdxInBuildSide + 1; 0 for absent
@@ -72,17 +113,47 @@ pub struct ArrayMap {
 }
 
 impl ArrayMap {
-    /// Creates a new [`ArrayKV`] from the given array of join keys.
+    /// Estimates the maximum memory usage for an `ArrayMap` with the given parameters.
+    ///
+    /// The estimation is composed of:
+    /// - `data`: `(max_val - min_val + 1) * size_of::<u32>()`
+    /// - `next`: `num_rows * size_of::<u32>()`
+    ///
+    /// This represents the largest possible memory footprint, as the `next`
+    /// buffer is only allocated if there are duplicate keys. By estimating for
+    /// the worst-case, we ensure sufficient memory is reserved.
+    pub fn estimate_memory_size(
+        min_val: u64,
+        max_val: u64,
+        num_rows: usize,
+    ) -> usize {
+        let range = max_val.wrapping_sub(min_val);
+        let size = (range + 1) as usize;
+        size * size_of::<u32>() + num_rows * size_of::<u32>()
+    }
+
+    /// Creates a new [`ArrayMap`] from the given array of join keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `min_val` / `max_val`: Passed as `u64` (casted from the native type) to allow
+    ///   wrapping arithmetic.
+    ///
+    ///   The caller MUST ensure that logically `min_val <= max_val` for the underlying
+    ///   data type, even if `min_val > max_val` when treated as unsigned (e.g. -5i8 vs 5i8).
     ///
     /// Note: This function processes only the non-null values in the input `array`,
     /// ignoring any rows where the key is `NULL`.
     ///
     pub(crate) fn try_new(
         array: &ArrayRef,
-        offset_val: u64,
-        range: usize,
+        min_val: u64,
+        max_val: u64,
     ) -> Result<Self> {
-        let mut data: Vec<u32> = vec![0; range];
+        let range = max_val.wrapping_sub(min_val);
+        let size = (range + 1) as usize;
+
+        let mut data: Vec<u32> = vec![0; size];
         let mut next: Vec<u32> = vec![];
         let mut num_of_distinct_key = 0;
 
@@ -90,7 +161,7 @@ impl ArrayMap {
             array.data_type() => (
                 fill_data,
                 array,
-                offset_val,
+                min_val,
                 &mut data,
                 &mut next,
                 &mut num_of_distinct_key
@@ -99,7 +170,7 @@ impl ArrayMap {
 
         Ok(Self {
             data,
-            offset: offset_val,
+            offset: min_val,
             next,
             num_of_distinct_key,
         })
@@ -206,8 +277,8 @@ impl ArrayMap {
                     continue;
                 }
                 // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
-                let prob_val = unsafe { arr.value_unchecked(prob_idx) }.as_();
-                let idx_in_build_side = (prob_val.wrapping_sub(self.offset)) as usize;
+                let prob_val: u64 = unsafe { arr.value_unchecked(prob_idx) }.as_();
+                let idx_in_build_side = prob_val.wrapping_sub(self.offset) as usize;
 
                 if idx_in_build_side >= self.data.len()
                     || self.data[idx_in_build_side] == 0
@@ -257,9 +328,10 @@ impl ArrayMap {
                 let is_last = prob_side_idx == arr.len() - 1;
 
                 // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
-                let prob_val = unsafe { arr.value_unchecked(prob_side_idx) }.as_();
+                let prob_val: u64 =
+                    unsafe { arr.value_unchecked(prob_side_idx) }.as_();
                 // todo extract to func
-                let idx_in_build_side = (prob_val.wrapping_sub(self.offset)) as usize;
+                let idx_in_build_side = prob_val.wrapping_sub(self.offset) as usize;
                 if idx_in_build_side >= self.data.len()
                     || self.data[idx_in_build_side] == 0
                 {
@@ -319,7 +391,7 @@ impl ArrayMap {
         for (i, val) in arr.iter().enumerate() {
             if let Some(val) = val {
                 let key: u64 = val.as_();
-                let idx = (key.wrapping_sub(self.offset)) as usize;
+                let idx = key.wrapping_sub(self.offset) as usize;
                 if idx < self.data.len() && self.data[idx] != 0 {
                     arrow::util::bit_util::set_bit(buf.as_slice_mut(), i);
                 }
@@ -332,6 +404,7 @@ impl ArrayMap {
 mod tests {
     use super::*;
     use arrow::array::Int32Array;
+    use arrow::array::Int64Array;
     use std::sync::Arc;
 
     #[test]
@@ -343,10 +416,7 @@ mod tests {
         // Key 8: idx 8
         let build_array: ArrayRef =
             Arc::new(Int32Array::from(vec![5, 10, 15, 5, 10, 15, 5, 7, 8]));
-        let offset_val = 5;
-        let range = 11;
-
-        let array_map = ArrayMap::try_new(&build_array, offset_val, range)?;
+        let array_map = ArrayMap::try_new(&build_array, 5, 15)?;
 
         let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![5, 10, 15, 7, 8, 9]));
         let prob_side_keys = [probe_array.clone()];
@@ -494,6 +564,47 @@ mod tests {
         assert_eq!(prob_indices, vec![1, 1, 3]);
         assert_eq!(build_indices, vec![0, 1, 0]);
         assert_eq!(result_offset, Some((3, Some(2))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_map_i64_with_negative_and_positive_numbers() -> Result<()> {
+        // Build array with a mix of negative and positive i64 values, no duplicates
+        let build_array: ArrayRef =
+            Arc::new(Int64Array::from(vec![-5, 0, 5, -2, 3, 10]));
+        let min_val = -5_i128;
+        let max_val = 10_i128;
+
+        let array_map = ArrayMap::try_new(&build_array, min_val as u64, max_val as u64)?;
+
+        // Probe array
+        let probe_array: ArrayRef =
+            Arc::new(Int64Array::from(vec![0, -5, 10, -1]));
+        let prob_side_keys = [probe_array.clone()];
+
+        let mut prob_indices = Vec::new();
+        let mut build_indices = Vec::new();
+
+        // Call once to get all matches
+        let result_offset = array_map.get_matched_indices_with_limit_offset(
+            &prob_side_keys,
+            10, // A batch size larger than number of probes
+            (0, None),
+            &mut prob_indices,
+            &mut build_indices,
+        )?;
+
+        // Expected matches, in probe-side order:
+        // Probe 0 (value 0) -> Build 1 (value 0)
+        // Probe 1 (value -5) -> Build 0 (value -5)
+        // Probe 2 (value 10) -> Build 5 (value 10)
+        let expected_prob_indices = vec![0, 1, 2];
+        let expected_build_indices = vec![1, 0, 5];
+
+        assert_eq!(prob_indices, expected_prob_indices);
+        assert_eq!(build_indices, expected_build_indices);
+        assert!(result_offset.is_none());
+
         Ok(())
     }
 }

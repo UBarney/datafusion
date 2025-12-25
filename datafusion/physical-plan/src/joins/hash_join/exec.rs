@@ -174,18 +174,15 @@ fn try_create_array_map(
         return Ok(None);
     }
 
-    let offset_val = min_val as u64;
-
-    // todo: move compute mem usage to ArrayMap
-    let size = (range + 1) as usize;
-    let mem_size = size * size_of::<u32>() /*arrayMap.data*/ + num_row * size_of::<u32>()/*arrayMap.next*/;
-
+    let mem_size =
+        ArrayMap::estimate_memory_size(min_val as u64, max_val as u64, num_row);
     reservation.try_grow(mem_size)?;
 
     let batch = concat_batches(schema, batches)?;
     let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
-    let array_map = ArrayMap::try_new(&left_values[0], offset_val, size)?;
+    let array_map =
+        ArrayMap::try_new(&left_values[0], min_val as u64, max_val as u64)?;
 
     Ok(Some((array_map, batch, left_values)))
 }
