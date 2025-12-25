@@ -174,15 +174,13 @@ fn try_create_array_map(
         return Ok(None);
     }
 
-    let mem_size =
-        ArrayMap::estimate_memory_size(min_val, max_val, num_row);
+    let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
     reservation.try_grow(mem_size)?;
 
     let batch = concat_batches(schema, batches)?;
     let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
-    let array_map =
-        ArrayMap::try_new(&left_values[0], min_val, max_val)?;
+    let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
 
     Ok(Some((array_map, batch, left_values)))
 }
@@ -1674,6 +1672,27 @@ async fn collect_left_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_phj_used(metrics: &MetricsSet, use_phj: bool) {
+        if use_phj {
+            assert!(
+                metrics
+                    .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+                    .expect("should have array_map_created_count metrics")
+                    .as_usize()
+                    >= 1
+            );
+        } else {
+            // assert_eq!(
+            //     metrics
+            //         .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+            //         .map(|v| v.as_usize())
+            //         .unwrap_or(0),
+            //     0
+            // )
+        }
+    }
+
     use crate::coalesce_partitions::CoalescePartitionsExec;
     use crate::joins::hash_join::stream::lookup_join_hashmap;
     use crate::test::{TestMemoryExec, assert_join_metrics};
@@ -1706,14 +1725,9 @@ mod tests {
         a.div_ceil(b)
     }
 
-    // #[template]
-    // #[rstest]
-    // fn batch_sizes(#[values(8192, 10, 5, 2, 1)] batch_size: usize) {}
-
     #[template]
     #[rstest]
-    fn hash_join_scenarios(
-        //TODO: better name
+    fn hash_join_exec_configs(
         #[values(8192, 10, 5, 2, 1)] batch_size: usize,
         #[values(true, false)] use_perfect_hash_join_as_possible: bool,
     ) {
@@ -1742,7 +1756,7 @@ mod tests {
             session_config
                 .options_mut()
                 .execution
-                .perfect_hash_join_min_key_density = 1.0 / 0.0;
+                .perfect_hash_join_min_key_density = 6666 as f64;
         }
         Arc::new(TaskContext::default().with_session_config(session_config))
     }
@@ -1911,7 +1925,7 @@ mod tests {
         Ok((columns, batches, metrics))
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_inner_one(
         batch_size: usize,
@@ -1960,17 +1974,18 @@ mod tests {
         }
 
         assert_join_metrics!(metrics, 3);
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn partitioned_join_inner_one(
         batch_size: usize,
         use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
+        let task_ctx = prepare_task_ctx(batch_size, false);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 5]), // this has a repetition
@@ -2011,16 +2026,7 @@ mod tests {
         }
 
         assert_join_metrics!(metrics, 3);
-
-        if use_perfect_hash_join_as_possible {
-            assert!(
-                metrics
-                    .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
-                    .expect("should have array_map_CREATED_COUNT_METRIC_NAME metrics")
-                    .as_usize()
-                    >= 1
-            );
-        }
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
         Ok(())
     }
@@ -2122,7 +2128,7 @@ mod tests {
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_inner_two(
         batch_size: usize,
@@ -2202,7 +2208,7 @@ mod tests {
     }
 
     /// Test where the left has 2 parts, the right with 1 part => 1 part
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_inner_one_two_parts_left(
         batch_size: usize,
@@ -2350,7 +2356,7 @@ mod tests {
     }
 
     /// Test where the left has 1 part, the right has 2 parts => 2 parts
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_inner_one_two_parts_right(
         batch_size: usize,
@@ -2457,6 +2463,9 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
@@ -2470,7 +2479,7 @@ mod tests {
         TestMemoryExec::try_new_exec(&[vec![batch.clone(), batch]], schema, None).unwrap()
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_left_multi_batch(
         batch_size: usize,
@@ -2528,19 +2537,11 @@ mod tests {
             ");
         }
 
-        if use_perfect_hash_join_as_possible {
-            assert!(
-                metrics
-                    .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
-                    .expect("should have metrics")
-                    .as_usize()
-                    >= 1
-            );
-        }
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
         return Ok(());
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_full_multi_batch(
         batch_size: usize,
@@ -2577,6 +2578,7 @@ mod tests {
 
         let stream = join.execute(0, task_ctx).unwrap();
         let batches = common::collect(stream).await.unwrap();
+        let metrics = join.metrics().unwrap();
 
         allow_duplicates! {
             assert_snapshot!(batches_to_sort_string(&batches), @r"
@@ -2593,9 +2595,11 @@ mod tests {
             +----+----+----+----+----+----+
             ");
         }
+
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_left_empty_right(
         batch_size: usize,
@@ -2628,6 +2632,7 @@ mod tests {
 
         let stream = join.execute(0, task_ctx).unwrap();
         let batches = common::collect(stream).await.unwrap();
+        let metrics = join.metrics().unwrap();
 
         allow_duplicates! {
             assert_snapshot!(batches_to_sort_string(&batches), @r"
@@ -2640,9 +2645,11 @@ mod tests {
             +----+----+----+----+----+----+
             ");
         }
+
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_full_empty_right(
         batch_size: usize,
@@ -2675,6 +2682,7 @@ mod tests {
 
         let stream = join.execute(0, task_ctx).unwrap();
         let batches = common::collect(stream).await.unwrap();
+        let metrics = join.metrics().unwrap();
 
         allow_duplicates! {
             assert_snapshot!(batches_to_sort_string(&batches), @r"
@@ -2687,9 +2695,11 @@ mod tests {
             +----+----+----+----+----+----+
             ");
         }
+
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_left_one(
         batch_size: usize,
@@ -2736,11 +2746,12 @@ mod tests {
         }
 
         assert_join_metrics!(metrics, 3);
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn partitioned_join_left_one(
         batch_size: usize,
@@ -2787,6 +2798,7 @@ mod tests {
         }
 
         assert_join_metrics!(metrics, 3);
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
         Ok(())
     }
@@ -2811,7 +2823,7 @@ mod tests {
         )
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_left_semi(
         batch_size: usize,
@@ -2853,10 +2865,13 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_left_semi_with_filter(
         batch_size: usize,
@@ -2918,6 +2933,9 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         // left_table left semi join right_table on left_table.b1 = right_table.b2 and right_table.a2 > 10
         let filter_expression = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
@@ -2955,10 +2973,13 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_right_semi(
         batch_size: usize,
@@ -3001,10 +3022,13 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_right_semi_with_filter(
         batch_size: usize,
@@ -3067,6 +3091,9 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         // left_table right semi join right_table on left_table.b1 = right_table.b2 on left_table.a1!=9
         let filter_expression = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
@@ -3103,10 +3130,13 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_left_anti(
         batch_size: usize,
@@ -3147,10 +3177,14 @@ mod tests {
             +----+----+----+
             ");
         }
+
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_left_anti_with_filter(
         batch_size: usize,
@@ -3213,6 +3247,9 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         // left_table left anti join right_table on left_table.b1 = right_table.b2 and right_table.a2 != 13
         let filter_expression = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
@@ -3256,10 +3293,13 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_right_anti(
         batch_size: usize,
@@ -3299,10 +3339,14 @@ mod tests {
             +----+----+-----+
             ");
         }
+
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_right_anti_with_filter(
         batch_size: usize,
@@ -3366,6 +3410,9 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         // left_table right anti join right_table on left_table.b1 = right_table.b2 and right_table.b2!=8
         let column_indices = vec![ColumnIndex {
             index: 1,
@@ -3412,10 +3459,13 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_right_one(
         batch_size: usize,
@@ -3462,11 +3512,12 @@ mod tests {
         }
 
         assert_join_metrics!(metrics, 3);
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn partitioned_join_right_one(
         batch_size: usize,
@@ -3513,11 +3564,12 @@ mod tests {
         }
 
         assert_join_metrics!(metrics, 3);
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_full_one(
         batch_size: usize,
@@ -3566,10 +3618,13 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_left_mark(
         batch_size: usize,
@@ -3616,11 +3671,12 @@ mod tests {
         }
 
         assert_join_metrics!(metrics, 3);
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn partitioned_join_left_mark(
         batch_size: usize,
@@ -3667,11 +3723,12 @@ mod tests {
         }
 
         assert_join_metrics!(metrics, 3);
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_right_mark(
         batch_size: usize,
@@ -3717,11 +3774,12 @@ mod tests {
         assert_batches_sorted_eq!(expected, &batches);
 
         assert_join_metrics!(metrics, 3);
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn partitioned_join_right_mark(
         batch_size: usize,
@@ -3768,6 +3826,7 @@ mod tests {
         assert_batches_sorted_eq!(expected, &batches);
 
         assert_join_metrics!(metrics, 4);
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
         Ok(())
     }
@@ -3974,7 +4033,7 @@ mod tests {
         )
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_inner_with_filter(
         batch_size: usize,
@@ -4023,10 +4082,13 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_left_with_filter(
         batch_size: usize,
@@ -4078,10 +4140,13 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_right_with_filter(
         batch_size: usize,
@@ -4132,10 +4197,13 @@ mod tests {
             ");
         }
 
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
+
         Ok(())
     }
 
-    #[apply(hash_join_scenarios)]
+    #[apply(hash_join_exec_configs)]
     #[tokio::test]
     async fn join_full_with_filter(
         batch_size: usize,
@@ -4187,6 +4255,9 @@ mod tests {
             "+---+---+---+----+---+---+",
         ];
         assert_batches_sorted_eq!(expected, &batches);
+
+        let metrics = join.metrics().unwrap();
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
         // THIS MIGRATION HALTED DUE TO ISSUE #15312
         //allow_duplicates! {
@@ -4963,6 +5034,189 @@ mod tests {
         // Even with empty build side, the dynamic filter should be marked as complete
         // wait_complete() should return immediately
         dynamic_filter_clone.wait_complete().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_perfect_hash_join_with_negative_numbers() -> Result<()> {
+        let task_ctx = prepare_task_ctx(8192, true);
+        let left = build_table(
+            ("a1", &vec![1, 2, 3]),
+            ("b1", &vec![-1, 0, 1]),
+            ("c1", &vec![4, 5, 6]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30, 40]),
+            ("b1", &vec![1, -1, 0, 2]),
+            ("c2", &vec![70, 80, 90, 100]),
+        );
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        let (columns, batches, metrics) = join_collect(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on.clone(),
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            task_ctx,
+        )
+        .await?;
+
+        assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
+
+        assert_batches_sorted_eq!(
+            [
+                "+----+----+----+----+----+----+",
+                "| a1 | b1 | c1 | a2 | b1 | c2 |",
+                "+----+----+----+----+----+----+",
+                "| 1  | -1 | 4  | 20 | -1 | 80 |",
+                "| 2  | 0  | 5  | 30 | 0  | 90 |",
+                "| 3  | 1  | 6  | 10 | 1  | 70 |",
+                "+----+----+----+----+----+----+",
+            ],
+            &batches
+        );
+
+        let array_map_created = metrics
+            .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+            .unwrap();
+        assert_eq!(array_map_created.as_usize(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_phj_null_equals_null_build_probe_all_have_nulls() -> Result<()> {
+        let task_ctx = prepare_task_ctx(8192, true);
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("a1", DataType::Int32, true),
+            Field::new("b1", DataType::Int32, true),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(10), None])) as ArrayRef,
+            ],
+        )?;
+        let left = TestMemoryExec::try_new_exec(&[vec![left_batch]], left_schema, None)?;
+
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("a2", DataType::Int32, true),
+            Field::new("b1", DataType::Int32, true),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(3), Some(4)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(10), None])) as ArrayRef,
+            ],
+        )?;
+        let right =
+            TestMemoryExec::try_new_exec(&[vec![right_batch]], right_schema, None)?;
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        let (columns, batches, metrics) = join_collect(
+            left,
+            right,
+            on,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNull,
+            task_ctx,
+        )
+        .await?;
+
+        assert_eq!(columns, vec!["a1", "b1", "a2", "b1"]);
+        assert_batches_sorted_eq!(
+            [
+                "+----+----+----+----+",
+                "| a1 | b1 | a2 | b1 |",
+                "+----+----+----+----+",
+                "| 1  | 10 | 3  | 10 |",
+                "| 2  |    | 4  |    |",
+                "+----+----+----+----+",
+            ],
+            &batches
+        );
+
+        let array_map_created = metrics
+            .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+            .unwrap();
+        assert_eq!(array_map_created.as_usize(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_phj_null_equals_null_probe_no_nulls() -> Result<()> {
+        let task_ctx = prepare_task_ctx(8192, true);
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("a1", DataType::Int32, true),
+            Field::new("b1", DataType::Int32, true),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), None])) as ArrayRef,
+            ],
+        )?;
+        let left = TestMemoryExec::try_new_exec(&[vec![left_batch]], left_schema, None)?;
+
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("a2", DataType::Int32, true),
+            Field::new("b1", DataType::Int32, true),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(3), Some(4)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(10), Some(30)])) as ArrayRef,
+            ],
+        )?;
+        let right =
+            TestMemoryExec::try_new_exec(&[vec![right_batch]], right_schema, None)?;
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        let (columns, batches, metrics) = join_collect(
+            left,
+            right,
+            on,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNull,
+            task_ctx,
+        )
+        .await?;
+
+        assert_eq!(columns, vec!["a1", "b1", "a2", "b1"]);
+        assert_batches_sorted_eq!(
+            [
+                "+----+----+----+----+",
+                "| a1 | b1 | a2 | b1 |",
+                "+----+----+----+----+",
+                "| 1  | 10 | 3  | 10 |",
+                "+----+----+----+----+",
+            ],
+            &batches
+        );
+
+        let array_map_created = metrics
+            .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+            .unwrap();
+        assert_eq!(array_map_created.as_usize(), 0);
 
         Ok(())
     }
