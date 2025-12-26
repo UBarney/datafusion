@@ -136,7 +136,7 @@ impl ArrayMap {
             ScalarValue::UInt8(Some(v)) => Some(*v as u64),
             ScalarValue::UInt16(Some(v)) => Some(*v as u64),
             ScalarValue::UInt32(Some(v)) => Some(*v as u64),
-            ScalarValue::UInt64(Some(v)) => Some(*v as u64),
+            ScalarValue::UInt64(Some(v)) => Some((*v)),
             _ => None,
         }
     }

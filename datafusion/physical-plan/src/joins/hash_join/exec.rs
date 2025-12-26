@@ -70,7 +70,7 @@ use arrow_schema::DataType;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
-    JoinSide, JoinType, NullEquality, Result, ScalarValue, assert_or_internal_err,
+    JoinSide, JoinType, NullEquality, Result, assert_or_internal_err,
     internal_err, plan_err, project_schema,
 };
 use datafusion_execution::TaskContext;
@@ -1617,7 +1617,7 @@ async fn collect_left_input(
 
             let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
 
-            (Map::HashMap(hashmap.into()), batch, left_values)
+            (Map::HashMap(hashmap), batch, left_values)
         };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
