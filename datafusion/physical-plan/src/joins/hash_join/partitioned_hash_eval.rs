@@ -216,7 +216,6 @@ impl PhysicalExpr for HashExpr {
 /// Physical expression that checks membership in a [`Map`] (hash table or array map).
 ///
 /// Returns a [`BooleanArray`] indicating if join keys (from `hash_expr`) exist in the map.
-/// Delegates `children()` to `hash_expr` to expose the underlying join key columns.
 // TODO: rename to MapLookupExpr
 pub struct HashTableLookupExpr {
     /// Expression that computes hash values and identifies join key columns
@@ -230,6 +229,10 @@ pub struct HashTableLookupExpr {
 impl HashTableLookupExpr {
     /// Create a new HashTableLookupExpr
     ///
+    /// # Arguments
+    /// * `hash_expr` - Expression that computes hash values and identifies join key columns
+    /// * `hash_map` - Hash table to check membership
+    /// * `description` - Description for debugging
     /// # Note
     /// This is public for internal testing purposes only and is not
     /// guaranteed to be stable across versions.
@@ -299,11 +302,13 @@ impl PhysicalExpr for HashTableLookupExpr {
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        let hash_expr = Arc::new(HashExpr::new(
-            children,
-            self.hash_expr.random_state.clone(),
-            self.hash_expr.description.clone(),
-        ));
+        let hash_expr = self.hash_expr.clone().with_new_children(children)?;
+        let hash_expr =
+            Arc::downcast::<HashExpr>(hash_expr).map_err(|_e| {
+                internal_datafusion_err!(
+                    "HashTableLookupExpr::with_new_children expected a HashExpr"
+                )
+            })?;
         Ok(Arc::new(Self::new(
             hash_expr,
             Arc::clone(&self.map),

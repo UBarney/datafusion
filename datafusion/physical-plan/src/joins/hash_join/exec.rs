@@ -1612,6 +1612,7 @@ async fn collect_left_input(
                 offset += batch.num_rows();
             }
 
+            // Merge all batches into a single batch, so we can directly index into the arrays
             let batch = concat_batches(&schema, batches_iter.clone())?;
 
             let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;

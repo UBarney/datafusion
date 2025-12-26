@@ -56,7 +56,7 @@ macro_rules! downcast_supported_integer {
 /// A dense map for single-column integer join keys within a limited range.
 ///
 /// Maps join keys to build-side indices using direct array indexing:
-/// `data[val - min_val_in_build_side] -> val_idx_in_build_side`.
+/// `data[val - min_val_in_build_side] -> val_idx_in_build_side + 1`.
 ///
 /// NULL values are ignored on both the build side and the probe side.
 ///
@@ -143,13 +143,6 @@ impl ArrayMap {
 
     /// Estimates the maximum memory usage for an `ArrayMap` with the given parameters.
     ///
-    /// The estimation is composed of:
-    /// - `data`: `(max_val - min_val + 1) * size_of::<u32>()`
-    /// - `next`: `num_rows * size_of::<u32>()`
-    ///
-    /// This represents the largest possible memory footprint, as the `next`
-    /// buffer is only allocated if there are duplicate keys. By estimating for
-    /// the worst-case, we ensure sufficient memory is reserved.
     pub fn estimate_memory_size(min_val: u64, max_val: u64, num_rows: usize) -> usize {
         let range = Self::calculate_range(min_val, max_val);
         let size = (range + 1) as usize;
@@ -253,7 +246,7 @@ impl ArrayMap {
     ) -> Result<Option<JoinHashMapOffset>> {
         if prob_side_keys.len() != 1 {
             return internal_err!(
-                "ArrayKV join expects 1 join key, but got {}",
+                "ArrayMap expects 1 join key, but got {}",
                 prob_side_keys.len()
             );
         }

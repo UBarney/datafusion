@@ -260,6 +260,8 @@ datafusion.execution.parquet.statistics_enabled page
 datafusion.execution.parquet.statistics_truncate_length 64
 datafusion.execution.parquet.write_batch_size 1024
 datafusion.execution.parquet.writer_version 1.0
+datafusion.execution.perfect_hash_join_min_key_density 0.99
+datafusion.execution.perfect_hash_join_small_build_threshold 1024
 datafusion.execution.planning_concurrency 13
 datafusion.execution.skip_partial_aggregation_probe_ratio_threshold 0.8
 datafusion.execution.skip_partial_aggregation_probe_rows_threshold 100000
