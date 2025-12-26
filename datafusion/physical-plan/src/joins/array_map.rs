@@ -353,7 +353,6 @@ impl ArrayMap {
 
                 // SAFETY: prob_idx is guaranteed to be within bounds by the loop range.
                 let prob_val: u64 = unsafe { arr.value_unchecked(prob_side_idx) }.as_();
-                // todo extract to func
                 let idx_in_build_side = prob_val.wrapping_sub(self.offset) as usize;
                 if idx_in_build_side >= self.data.len()
                     || self.data[idx_in_build_side] == 0
