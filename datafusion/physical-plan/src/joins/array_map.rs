@@ -16,6 +16,7 @@
 // under the License.
 
 use arrow::buffer::MutableBuffer;
+use arrow_schema::DataType;
 use num_traits::AsPrimitive;
 use std::mem::size_of;
 
@@ -23,7 +24,7 @@ use crate::joins::chain::traverse_chain;
 use crate::joins::join_hash_map::JoinHashMapOffset;
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::ArrowNumericType;
-use datafusion_common::{Result, internal_err};
+use datafusion_common::{Result, ScalarValue, internal_err};
 
 /// A macro to downcast only supported integer types (up to 64-bit) and invoke a generic function.
 ///
@@ -112,6 +113,34 @@ pub struct ArrayMap {
 }
 
 impl ArrayMap {
+    pub fn is_supported_type(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        )
+    }
+
+    pub(crate) fn key_to_u64(v: &ScalarValue) -> Option<u64> {
+        match v {
+            ScalarValue::Int8(Some(v)) => Some(*v as u64),
+            ScalarValue::Int16(Some(v)) => Some(*v as u64),
+            ScalarValue::Int32(Some(v)) => Some(*v as u64),
+            ScalarValue::Int64(Some(v)) => Some(*v as u64),
+            ScalarValue::UInt8(Some(v)) => Some(*v as u64),
+            ScalarValue::UInt16(Some(v)) => Some(*v as u64),
+            ScalarValue::UInt32(Some(v)) => Some(*v as u64),
+            ScalarValue::UInt64(Some(v)) => Some(*v as u64),
+            _ => None,
+        }
+    }
+
     /// Estimates the maximum memory usage for an `ArrayMap` with the given parameters.
     ///
     /// The estimation is composed of:

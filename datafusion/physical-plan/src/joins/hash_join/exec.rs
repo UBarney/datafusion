@@ -136,21 +136,9 @@ fn try_create_array_map(
             return internal_err!("min_val>max_val");
         }
 
-        let to_u64 = |v: &ScalarValue| -> Option<u64> {
-            match v {
-                ScalarValue::Int8(Some(v)) => Some(*v as u64),
-                ScalarValue::Int16(Some(v)) => Some(*v as u64),
-                ScalarValue::Int32(Some(v)) => Some(*v as u64),
-                ScalarValue::Int64(Some(v)) => Some(*v as u64),
-                ScalarValue::UInt8(Some(v)) => Some(*v as u64),
-                ScalarValue::UInt16(Some(v)) => Some(*v as u64),
-                ScalarValue::UInt32(Some(v)) => Some(*v as u64),
-                ScalarValue::UInt64(Some(v)) => Some(*v as u64),
-                _ => None,
-            }
-        };
-
-        if let Some((mi, ma)) = to_u64(&min_val).zip(to_u64(&max_val)) {
+        if let Some((mi, ma)) =
+            ArrayMap::key_to_u64(&min_val).zip(ArrayMap::key_to_u64(&max_val))
+        {
             (mi, ma)
         } else {
             return Ok(None);
@@ -1460,17 +1448,7 @@ fn should_collect_min_max_for_perfect_hash(
 
     let expr = &on_left[0];
     let data_type = expr.data_type(schema)?;
-    Ok(matches!(
-        data_type,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-    ))
+    Ok(ArrayMap::is_supported_type(&data_type))
 }
 
 /// Collects all batches from the left (build) side stream and creates a hash map for joining.
