@@ -136,7 +136,7 @@ impl ArrayMap {
             ScalarValue::UInt8(Some(v)) => Some(*v as u64),
             ScalarValue::UInt16(Some(v)) => Some(*v as u64),
             ScalarValue::UInt32(Some(v)) => Some(*v as u64),
-            ScalarValue::UInt64(Some(v)) => Some((*v)),
+            ScalarValue::UInt64(Some(v)) => Some(*v),
             _ => None,
         }
     }
@@ -434,7 +434,7 @@ mod tests {
         let array_map = ArrayMap::try_new(&build_array, 5, 15)?;
 
         let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![5, 10, 15, 7, 8, 9]));
-        let prob_side_keys = [probe_array.clone()];
+        let prob_side_keys = [Arc::clone(&probe_array)];
 
         let mut prob_indices = Vec::new();
         let mut build_indices = Vec::new();
@@ -593,7 +593,7 @@ mod tests {
 
         // Probe array
         let probe_array: ArrayRef = Arc::new(Int64Array::from(vec![0, -5, 10, -1]));
-        let prob_side_keys = [probe_array.clone()];
+        let prob_side_keys = [Arc::clone(&probe_array)];
 
         let mut prob_indices = Vec::new();
         let mut build_indices = Vec::new();

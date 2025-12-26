@@ -5108,7 +5108,7 @@ mod tests {
             Field::new("b1", DataType::Int32, true),
         ]));
         let left_batch = RecordBatch::try_new(
-            left_schema.clone(),
+            Arc::clone(&left_schema),
             vec![
                 Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef,
                 Arc::new(Int32Array::from(vec![Some(10), None])) as ArrayRef,
@@ -5121,7 +5121,7 @@ mod tests {
             Field::new("b1", DataType::Int32, true),
         ]));
         let right_batch = RecordBatch::try_new(
-            right_schema.clone(),
+            Arc::clone(&right_schema),
             vec![
                 Arc::new(Int32Array::from(vec![Some(3), Some(4)])) as ArrayRef,
                 Arc::new(Int32Array::from(vec![Some(10), None])) as ArrayRef,
@@ -5174,7 +5174,7 @@ mod tests {
             Field::new("b1", DataType::Int32, true),
         ]));
         let left_batch = RecordBatch::try_new(
-            left_schema.clone(),
+            Arc::clone(&left_schema),
             vec![
                 Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
                 Arc::new(Int32Array::from(vec![Some(10), Some(20), None])) as ArrayRef,
@@ -5187,7 +5187,7 @@ mod tests {
             Field::new("b1", DataType::Int32, true),
         ]));
         let right_batch = RecordBatch::try_new(
-            right_schema.clone(),
+            Arc::clone(&right_schema),
             vec![
                 Arc::new(Int32Array::from(vec![Some(3), Some(4)])) as ArrayRef,
                 Arc::new(Int32Array::from(vec![Some(10), Some(30)])) as ArrayRef,

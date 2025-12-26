@@ -315,7 +315,6 @@ impl RunOpt {
                         table_path
                     );
                 }
-                // TODO: add -f to specify format parqet|csv
                 ctx.register_parquet(
                     *table,
                     table_path.to_str().unwrap(),

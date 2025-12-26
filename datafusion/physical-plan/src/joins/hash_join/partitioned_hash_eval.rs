@@ -302,7 +302,7 @@ impl PhysicalExpr for HashTableLookupExpr {
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        let hash_expr = self.hash_expr.clone().with_new_children(children)?;
+        let hash_expr = Arc::clone(&self.hash_expr).with_new_children(children)?;
         let hash_expr =
             Arc::downcast::<HashExpr>(hash_expr).map_err(|_e| {
                 internal_datafusion_err!(
