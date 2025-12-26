@@ -262,6 +262,33 @@ impl JoinLeftData {
 /// `<col1> != <col2>`) are known as "filter expressions" and are evaluated
 /// after the equijoin predicates.
 ///
+/// # ArrayMap Optimization
+///
+/// For joins with a single integer-based join key, `HashJoinExec` may use an [`ArrayMap`]
+/// (also known as a "perfect hash join") instead of a general-purpose hash map.
+/// This optimization is used when:
+/// 1. There is exactly one join key.
+/// 2. The join key can be converted to `u64` (e.g., integers).
+/// 3. The range of keys is small enough (controlled by `perfect_hash_join_small_build_threshold`)
+///    OR the keys are sufficiently dense (controlled by `perfect_hash_join_min_key_density`).
+///
+/// See [`try_create_array_map`] for more details.
+///
+/// Note that when using [`PartitionMode::Partitioned`], the build side is split into multiple
+/// partitions. This can cause a dense build side to become sparse within each partition,
+/// potentially disabling this optimization.
+///
+/// For example, consider:
+/// ```sql
+/// SELECT t1.value, t2.value
+/// FROM range(10000) AS t1
+/// JOIN range(10000) AS t2
+///   ON t1.value = t2.value;
+/// ```
+/// With 24 partitions, each partition will only receive a subset of the 10,000 rows.
+/// The first partition might contain values like `3, 10, 18, 39, 43`, which are sparse
+/// relative to the original range, even though the overall data set is dense.
+///
 /// # "Build Side" vs "Probe Side"
 ///
 /// HashJoin takes two inputs, which are referred to as the "build" and the
@@ -295,9 +322,9 @@ impl JoinLeftData {
 ///    Resulting hash table stores hashed join-key fields for each row as a key, and
 ///    indices of corresponding rows in concatenated batch.
 ///
-/// Hash join uses LIFO data structure as a hash table, and in order to retain
-/// original build-side input order while obtaining data during probe phase, hash
-/// table is updated by iterating batch sequence in reverse order -- it allows to
+/// When using the standard `JoinHashMap`, hash join uses LIFO data structure as a hash table,
+/// and in order to retain original build-side input order while obtaining data during probe phase,
+/// hash table is updated by iterating batch sequence in reverse order -- it allows to
 /// keep rows with smaller indices "on the top" of hash table, and still maintain
 /// correct indexing for concatenated build-side data batch.
 ///

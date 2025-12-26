@@ -54,11 +54,10 @@ macro_rules! downcast_supported_integer {
 
 /// A dense map for single-column integer join keys within a limited range.
 ///
-/// Uses integer keys directly as indices into a `Vec` for O(1) lookups without hashing.
+/// Maps join keys to build-side indices using direct array indexing:
+/// `data[val - min_val_in_build_side] -> val_idx_in_build_side`.
 ///
-/// # NULL Handling
-/// - `NullEquality::NullEqualsNothing`: Supported; NULLs are ignored on both sides.
-/// - `NullEquality::NullEqualsNull`: **Not supported** if the build side contains NULLs.
+/// NULL values are ignored on both the build side and the probe side.
 ///
 /// # Handling Negative Numbers with `wrapping_sub`
 ///
@@ -77,7 +76,7 @@ macro_rules! downcast_supported_integer {
 /// * `min_val (-5)` casts to `u64`: `...11111011` (`u64::MAX - 4`)
 /// * `max_val (5)` casts to `u64`: `...00000101` (`5`)
 ///
-/// **1. Range Calculation (in `try_new`)**
+/// **1. Range Calculation**
 ///
 /// ```text
 /// In modular arithmetic, this is equivalent to:
