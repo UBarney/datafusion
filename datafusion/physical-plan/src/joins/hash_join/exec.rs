@@ -1517,7 +1517,7 @@ async fn collect_left_input(
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
-    let should_collect_for_perfect_hash =
+    let should_collect_min_max_for_phj =
         should_collect_min_max_for_perfect_hash(&on_left, &schema)?;
 
     let initial = BuildSideState::try_new(
@@ -1525,7 +1525,7 @@ async fn collect_left_input(
         reservation,
         on_left.clone(),
         &schema,
-        should_compute_dynamic_filters || should_collect_for_perfect_hash,
+        should_compute_dynamic_filters || should_collect_min_max_for_phj,
     )?;
 
     let state = left_stream
@@ -1563,7 +1563,7 @@ async fn collect_left_input(
     } = state;
 
     // Compute bounds
-    let bounds = match bounds_accumulators {
+    let mut bounds = match bounds_accumulators {
         Some(accumulators) if num_rows > 0 => {
             let bounds = accumulators
                 .into_iter()
@@ -1681,6 +1681,10 @@ async fn collect_left_input(
             PushdownStrategy::HashTable(Arc::clone(&map))
         }
     };
+
+    if should_collect_min_max_for_phj && !should_compute_dynamic_filters {
+        bounds = None;
+    }
 
     let data = JoinLeftData {
         map,
