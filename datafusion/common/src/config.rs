@@ -468,9 +468,9 @@ config_namespace! {
         /// metadata memory consumption
         pub batch_size: usize, default = 8192
 
-        /// A perfect hash join will be considered if the number of rows on the build
-        /// side is below this threshold. This provides a fast path for joins with
-        /// very small build sides, bypassing the density check.
+        /// A perfect hash join will be considered if the range of keys (max - min) on the build
+        /// side is < this threshold. This provides a fast path for joins with
+        /// very small key ranges, bypassing the density check.
         /// 
         /// TODO: Currently only supports cases where left_side.num_rows() < u32::MAX.
         /// Support for left_side.num_rows() >= u32::MAX will be added in the future.
@@ -479,9 +479,8 @@ config_namespace! {
         /// The minimum required density of join keys on the build side to consider a
         /// perfect hash join. Density is calculated as:
         /// `(number of rows) / (max_key - min_key + 1)`.
-        /// A perfect hash join may be used if the actual key density exceeds this
-        /// value. For example, a value of 0.99 means the keys must fill at least
-        /// 99% of their value range.
+        /// A perfect hash join may be used if the actual key density > this
+        /// value.
         /// 
         /// TODO: Currently only supports cases where left_side.num_rows() < u32::MAX.
         /// Support for left_side.num_rows() >= u32::MAX will be added in the future.

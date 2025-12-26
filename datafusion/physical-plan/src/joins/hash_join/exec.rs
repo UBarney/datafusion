@@ -168,8 +168,8 @@ fn try_create_array_map(
         return Ok(None);
     }
 
-    if range > perfect_hash_join_small_build_threshold as u64
-        && dense_ratio < perfect_hash_join_min_key_density
+    if range >= perfect_hash_join_small_build_threshold as u64
+        && dense_ratio <= perfect_hash_join_min_key_density
     {
         return Ok(None);
     }
@@ -1683,13 +1683,13 @@ mod tests {
                     >= 1
             );
         } else {
-            // assert_eq!(
-            //     metrics
-            //         .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
-            //         .map(|v| v.as_usize())
-            //         .unwrap_or(0),
-            //     0
-            // )
+            assert_eq!(
+                metrics
+                    .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+                    .map(|v| v.as_usize())
+                    .unwrap_or(0),
+                0
+            )
         }
     }
 
@@ -1756,7 +1756,7 @@ mod tests {
             session_config
                 .options_mut()
                 .execution
-                .perfect_hash_join_min_key_density = 6666 as f64;
+                .perfect_hash_join_min_key_density = 1.0 / 0.0;
         }
         Arc::new(TaskContext::default().with_session_config(session_config))
     }
@@ -1985,7 +1985,7 @@ mod tests {
         batch_size: usize,
         use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, false);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
         let left = build_table(
             ("a1", &vec![1, 2, 3]),
             ("b1", &vec![4, 5, 5]), // this has a repetition
