@@ -20,6 +20,7 @@
 //! ["on" values] to a list of indices with this key's value.
 
 use std::fmt::{self, Debug};
+use std::mem::size_of;
 use std::ops::Sub;
 
 use arrow::datatypes::ArrowNativeType;
@@ -129,6 +130,9 @@ pub trait JoinHashMapType: Send + Sync {
 
     /// Returns the number of entries in the join hash map.
     fn len(&self) -> usize;
+
+    /// Returns the memory usage of this hash map in bytes.
+    fn size(&self) -> usize;
 }
 
 pub struct JoinHashMapU32 {
@@ -203,6 +207,12 @@ impl JoinHashMapType for JoinHashMapU32 {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    fn size(&self) -> usize {
+        let table_size = self.map.allocation_size();
+        let next_size = self.next.capacity() * size_of::<u32>();
+        table_size + next_size
+    }
 }
 
 pub struct JoinHashMapU64 {
@@ -276,6 +286,12 @@ impl JoinHashMapType for JoinHashMapU64 {
 
     fn len(&self) -> usize {
         self.map.len()
+    }
+
+    fn size(&self) -> usize {
+        let table_size = self.map.allocation_size();
+        let next_size = self.next.capacity() * size_of::<u64>();
+        table_size + next_size
     }
 }
 

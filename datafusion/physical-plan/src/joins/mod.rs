@@ -71,6 +71,8 @@ impl Map {
 pub(crate) type MapOffset = (usize, Option<u64>);
 
 #[cfg(test)]
+mod map_comparison_test;
+#[cfg(test)]
 pub mod test_utils;
 
 /// The on clause of the join, as vector of (left, right) columns.

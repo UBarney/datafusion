@@ -101,6 +101,13 @@ impl JoinHashMapType for PruningJoinHashMap {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    fn size(&self) -> usize {
+        let map_size = self.map.allocation_size();
+        let next_size = self.next.capacity() * size_of::<u64>();
+
+        map_size + next_size
+    }
 }
 
 /// The `PruningJoinHashMap` is similar to a regular `JoinHashMap`, but with
