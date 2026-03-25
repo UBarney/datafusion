@@ -52,9 +52,11 @@ use datafusion_functions_aggregate_common::utils::get_sort_options;
 use datafusion_macros::user_doc;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
+mod flatten_state;
 mod state;
 
 use state::{BytesValueState, PrimitiveValueState, ValueState};
+use flatten_state::FlattenBytesValueState;
 
 create_func!(FirstValue, first_value_udaf);
 create_func!(LastValue, last_value_udaf);
@@ -115,7 +117,7 @@ fn create_groups_bytes_accumulator(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(Box::new(FirstLastGroupsAccumulator::try_new(
-        BytesValueState::try_new(args.return_field.data_type().clone())?,
+        FlattenBytesValueState::try_new(args.return_field.data_type().clone())?,
         ordering,
         args.ignore_nulls,
         &ordering_dtypes,
